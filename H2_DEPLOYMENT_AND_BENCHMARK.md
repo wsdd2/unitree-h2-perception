@@ -16,7 +16,7 @@ H2 侧已有约定：
 
 - DDS 网卡通常是 `eth0`，必要时改成实际网卡名。
 - H2 机器人基座/身体坐标当前配置为 `torso_link`。
-- 右腕虚拟末端可参考 `h2_handeye` 的 `R_ee = right_wrist_yaw_link + [0.05, 0, 0] m`。
+- 当前手眼与运控统一使用物理 `right_wrist_yaw_link`，不再使用前移 5 cm 的虚拟 `R_ee`。
 - 如果是 `eye-to-hand` 相机，优先使用 `T_cam2base.npy` 直接输出世界/基座坐标。
 - 当前正式配置使用 `eye-in-hand`：`/home/unitree/MscapeTech/Hand_Eye_Calib/outputs/eye_in_hand_20260630_150210.json`，节点会自动解析同名 `_npy/T_cam2hand.npy`，并通过 H2 当前关节 FK 输出 `torso_link` 坐标。
 
@@ -199,13 +199,13 @@ coordinate_projector:
     network_interface: eth0
     domain_id: 0
     lowstate_topic: rt/lowstate
-    lock_waist: true
-    h2_ee_offset_xyz: [0.05, 0.0, 0.0]
+    lock_waist: false
+    h2_ee_offset_xyz: [0.0, 0.0, 0.0]
     publish_target_joint_state: true
     target_joint_state_topic: /detector/target_joint_state
     ik_target_link: right_wrist_yaw_link
     ik_active_joints: 'right_shoulder_pitch_joint,right_shoulder_roll_joint,right_shoulder_yaw_joint,right_elbow_joint,right_wrist_roll_joint,right_wrist_pitch_joint,right_wrist_yaw_joint'
-    ik_end_effector_offset_xyz: [0.05, 0.0, 0.0]
+    ik_end_effector_offset_xyz: [0.0, 0.0, 0.0]
 ```
 
 其中 `/detector/target_joint_state` 是 IK 解算出的目标关节角建议值，只读发布，不会直接控制机器人运动。

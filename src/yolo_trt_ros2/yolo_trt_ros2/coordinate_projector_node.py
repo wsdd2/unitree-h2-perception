@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import re
 import sys
 import time
 import ctypes
@@ -79,6 +80,12 @@ except ImportError:  # pragma: no cover - tf2_ros is provided by ROS.
 
 from detector_msgs.msg import Object3D, Object3DArray, RobotInspectionStatus
 from detector_msgs.msg import Object2DArray
+from yolo_trt_ros2.work_tag_detector import (
+    is_hang_hook_class,
+    is_work_tag_grasp_class,
+    stage_prefers_hang_hook,
+    stage_prefers_work_tag_grasp,
+)
 
 
 G1_H2_JOINT_INDEX = {
@@ -196,7 +203,13 @@ class CoordinateProjectorNode(Node):
             [0.0, 0.0, 0.0],
             3,
         )
+        self.xr_ee_offset_from_wrist_xyz = self._get_float_list_parameter(
+            'xr_ee_offset_from_wrist_xyz',
+            [0.0, 0.0, 0.0],
+            3,
+        )
         self.dex1_tip_from_wrist_xyz = self._get_float_list_parameter('dex1_tip_from_wrist_xyz', [0.05, 0.0, 0.0], 3)
+        self.apply_tip_compensation = bool(self.get_parameter('apply_tip_compensation').value)
         self.blue_point_target_world_offset_xyz = self._get_float_list_parameter(
             'blue_point_target_world_offset_xyz',
             [0.0, 0.0, 0.0],
@@ -228,6 +241,11 @@ class CoordinateProjectorNode(Node):
         self.depth_scale = float(self.get_parameter('depth_scale').value)
         self.min_depth_m = float(self.get_parameter('min_depth_m').value)
         self.max_depth_m = float(self.get_parameter('max_depth_m').value)
+        self.foreground_max_depth_m = float(self.get_parameter('foreground_max_depth_m').value)
+        self.handle_max_depth_m = float(self.get_parameter('handle_max_depth_m').value)
+        self.control_row_z_tolerance_m = float(
+            self.get_parameter('control_row_z_tolerance_m').value
+        )
         self.pixel_query_max_depth_m = float(self.get_parameter('pixel_query_max_depth_m').value)
         self.publish_invalid = bool(self.get_parameter('publish_invalid').value)
         self.publish_target_pose = bool(self.get_parameter('publish_target_pose').value)
@@ -282,6 +300,7 @@ class CoordinateProjectorNode(Node):
         self._fk_error = ''
         self._ik_error = ''
         self._last_ik_warning_sec = 0.0
+        self._last_fk_warning_sec = 0.0
         self._last_depth_sync_warning_sec = 0.0
         self._last_3d_diagnostic_log_sec = 0.0
         self._last_3d_diagnostic_snapshot = None
@@ -336,6 +355,24 @@ class CoordinateProjectorNode(Node):
                 self.handeye_npy_path or '<none>',
             )
         )
+        effective_tip = (
+            np.asarray(self.dex1_tip_from_wrist_xyz, dtype=np.float64)
+            - np.asarray(self.handeye_mount_offset_from_wrist_xyz, dtype=np.float64)
+        )
+        self.get_logger().info(
+            'Target compensation active: dex1_tip_from_wrist=%s '
+            'handeye_mount_offset=%s xr_ee_offset=%s effective_tip_from_mount=%s '
+            'apply_tip_compensation=%s lock_world_offset=%s depth_scale=%.6f'
+            % (
+                self._format_xyz(self.dex1_tip_from_wrist_xyz),
+                self._format_xyz(self.handeye_mount_offset_from_wrist_xyz),
+                self._format_xyz(self.xr_ee_offset_from_wrist_xyz),
+                self._format_xyz(effective_tip),
+                self.apply_tip_compensation,
+                self._format_xyz(self.blue_point_target_world_offset_xyz),
+                self.depth_scale,
+            )
+        )
 
     def _declare_parameters(self):
         self.declare_parameter('objects_topic', '/detector/objects')
@@ -367,7 +404,9 @@ class CoordinateProjectorNode(Node):
         self.declare_parameter('joint_json_path', '')
         self.declare_parameter('lock_waist', True)
         self.declare_parameter('handeye_mount_offset_from_wrist_xyz', [0.0, 0.0, 0.0])
+        self.declare_parameter('xr_ee_offset_from_wrist_xyz', [0.0, 0.0, 0.0])
         self.declare_parameter('dex1_tip_from_wrist_xyz', [0.05, 0.0, 0.0])
+        self.declare_parameter('apply_tip_compensation', True)
         self.declare_parameter('blue_point_target_world_offset_xyz', [0.0, 0.0, 0.0])
         self.declare_parameter('fk_backend', 'auto')
         self.declare_parameter('h2_xr_scripts_dir', '/home/unitree/H2_joint_cartesian/scripts')
@@ -392,6 +431,9 @@ class CoordinateProjectorNode(Node):
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('min_depth_m', 0.10)
         self.declare_parameter('max_depth_m', 5.0)
+        self.declare_parameter('foreground_max_depth_m', 1.2)
+        self.declare_parameter('handle_max_depth_m', 1.0)
+        self.declare_parameter('control_row_z_tolerance_m', 0.04)
         self.declare_parameter('pixel_query_max_depth_m', 1.2)
         self.declare_parameter('publish_invalid', False)
         self.declare_parameter('publish_target_pose', True)
@@ -552,8 +594,11 @@ class CoordinateProjectorNode(Node):
     def _ensure_xr_fk(self):
         if self._xr_ik is not None and self._xr_current_ee_poses is not None:
             return
-        if self.base_link != 'pelvis':
-            raise RuntimeError('xr_pinocchio FK only supports base_link=pelvis')
+        if self.base_link not in ('pelvis', 'torso', 'torso_link'):
+            raise RuntimeError(
+                'xr_pinocchio FK supports base_link=pelvis or torso_link, got %s'
+                % self.base_link
+            )
         candidates = [
             Path(os.path.expanduser(self.h2_xr_scripts_dir)) if self.h2_xr_scripts_dir else None,
             Path(os.path.expanduser(self.workspace_root)) / 'H2_joint_control' / 'H2_joint_cartesian' / 'scripts',
@@ -565,11 +610,44 @@ class CoordinateProjectorNode(Node):
             text = str(candidate)
             if text not in sys.path:
                 sys.path.insert(0, text)
-        from h2_xr_official_ik_demo import H2CompatibleIK, current_ee_poses
 
-        self._xr_ik = H2CompatibleIK()
+        module_path = None
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            path = candidate / 'h2_xr_official_ik_demo.py'
+            if path.is_file():
+                module_path = path
+                break
+        if module_path is None:
+            raise FileNotFoundError('Cannot locate h2_xr_official_ik_demo.py in configured candidates.')
+
+        import importlib.util
+        import inspect
+
+        module_name = '_yolo_trt_ros2_h2_xr_runtime'
+        spec = importlib.util.spec_from_file_location(module_name, str(module_path))
+        if spec is None or spec.loader is None:
+            raise ImportError('Cannot load xr_pinocchio module from %s' % module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        current_ee_poses = module.current_ee_poses
+        signature = inspect.signature(current_ee_poses)
+        required_parameters = {'waist_q', 'reference_frame'}
+        missing_parameters = required_parameters.difference(signature.parameters)
+        if missing_parameters:
+            raise RuntimeError(
+                'Waist/torso-aware current_ee_poses is required; missing %s in signature %s from %s'
+                % (sorted(missing_parameters), signature, module_path)
+            )
+
+        self._xr_ik = module.H2CompatibleIK()
         self._xr_current_ee_poses = current_ee_poses
-        self.get_logger().info('xr_pinocchio FK initialized from %s' % (self.h2_xr_scripts_dir or '<auto>'))
+        self.get_logger().info(
+            'xr_pinocchio FK initialized: module=%s current_ee_poses%s'
+            % (module_path, signature)
+        )
 
     def _resolve_handeye_input(self, path):
         resolved = Path(os.path.expanduser(path))
@@ -746,9 +824,24 @@ class CoordinateProjectorNode(Node):
             transform_message = 'eye_in_hand_fk; ' + target_message
         elif self.handeye_transform is not None:
             point_world = self._apply_transform(self.handeye_transform, point_camera)
-            point_target = point_world
+            joints = self._current_joint_values()
+            if not joints:
+                result['message'] = 'eye_to_hand target compensation unavailable: missing joints'
+                self._publish_pixel_query_result(result)
+                return
+            try:
+                T_base_hand = self._compute_base_to_hand(joints)
+            except Exception as exc:
+                result['message'] = 'eye_to_hand target compensation FK failed: %s' % exc
+                self._publish_pixel_query_result(result)
+                return
+            point_target, target_message = self._action_target_for_detection(
+                None,
+                point_world,
+                T_base_hand,
+            )
             target_frame = self.handeye_target_frame or self.target_frame or 'base_link'
-            transform_message = 'handeye_npy'
+            transform_message = 'eye_to_hand; ' + target_message
         elif self.target_frame:
             transformed = self._transform_point(point_camera, msg.header.frame_id, self.target_frame)
             if transformed is None:
@@ -833,11 +926,12 @@ class CoordinateProjectorNode(Node):
         self.latest_depth_stamp_ns, self.latest_depth = depth_match
         self._frame_handle_reference = self._best_handle_reference(objects_msg.objects)
 
-        # Keep all projected objects for perception/grasp diagnostics, but the
-        # public action target must be the circular push point only. Selecting the
-        # highest-confidence object used to publish the handle center whenever
-        # its YOLO confidence exceeded the OpenCV blue-point confidence.
+        # Keep all projected objects for perception/grasp diagnostics.
+        # Default action target remains the circular push point; hang-tag
+        # stages override that with the grasp point or cabinet hook.
         best_blue_obj = None
+        best_grasp_obj = None
+        best_hook_obj = None
         for obj in objects_msg.objects:
             if not self._passes_filter(obj):
                 continue
@@ -846,24 +940,83 @@ class CoordinateProjectorNode(Node):
             object_3d = self._project_object(obj, objects_msg.header)
             if object_3d.valid or self.publish_invalid:
                 out_msg.objects.append(object_3d)
-            if (
-                object_3d.valid
-                and self._is_blue_point_detection(obj)
-                and (
-                    best_blue_obj is None
-                    or obj.confidence > best_blue_obj.detection.confidence
-                )
+            if not object_3d.valid:
+                continue
+            if self._is_blue_point_detection(obj) and (
+                best_blue_obj is None
+                or obj.confidence > best_blue_obj.detection.confidence
             ):
                 best_blue_obj = object_3d
+            if is_work_tag_grasp_class(obj.class_name) and (
+                best_grasp_obj is None
+                or obj.confidence > best_grasp_obj.detection.confidence
+            ):
+                best_grasp_obj = object_3d
+            if is_hang_hook_class(obj.class_name) and (
+                best_hook_obj is None
+                or obj.confidence > best_hook_obj.detection.confidence
+            ):
+                best_hook_obj = object_3d
 
+        self._apply_3d_control_row_semantics(out_msg.objects)
         self._log_3d_diagnostics_if_changed(out_msg.objects)
         self.objects_3d_pub.publish(out_msg)
         joints = self._current_joint_values()
         if joints:
             self._publish_current_joint_state(joints, objects_msg.header)
         self._publish_objects_ik_json(out_msg, objects_msg.header, joints)
-        if best_blue_obj is not None:
-            self._publish_target(best_blue_obj)
+
+        target_obj = self._select_action_target(best_blue_obj, best_grasp_obj, best_hook_obj)
+        if target_obj is not None:
+            self._publish_target(target_obj)
+
+    def _select_action_target(self, best_blue_obj, best_grasp_obj, best_hook_obj):
+        status = self._robot_status_payload(getattr(self, 'latest_robot_status', None))
+        stage_id = int(status.get('stage_id', 0) or 0)
+        stage_name = str(status.get('stage_name', '') or '')
+        if stage_prefers_work_tag_grasp(stage_id, stage_name) and best_grasp_obj is not None:
+            return best_grasp_obj
+        if stage_prefers_hang_hook(stage_id, stage_name) and best_hook_obj is not None:
+            return best_hook_obj
+        return best_blue_obj
+
+    def _apply_3d_control_row_semantics(self, objects):
+        button_z = [
+            float(obj.point_target.z)
+            for obj in objects
+            if obj.valid
+            and str(obj.detection.class_name).lower()
+            in ('red push button', 'green push button')
+        ]
+        if not button_z:
+            return
+        reference_z = float(np.median(button_z))
+        tolerance = max(0.005, self.control_row_z_tolerance_m)
+        for obj in objects:
+            if not obj.valid:
+                continue
+            detection = obj.detection
+            if 'rotary selector switch' not in str(detection.class_name).lower():
+                continue
+            delta_z = float(obj.point_target.z) - reference_z
+            detection.spatial_relation = (
+                'top_row' if abs(delta_z) <= tolerance else 'middle_row'
+            )
+            parts = [str(detection.class_name)]
+            parts.append(str(detection.spatial_relation))
+            label = str(getattr(detection, 'label_text', '')).strip()
+            if label:
+                parts.append(label)
+            elif bool(getattr(detection, 'label_tag_present', False)):
+                parts.append('with_tag')
+            detection.semantic_name = '/'.join(parts)
+            suffix = '/'.join(parts[1:])
+            class_id = re.sub(
+                r'[^a-z0-9]+',
+                '_',
+                str(detection.class_name).lower(),
+            ).strip('_')
+            detection.control_id = '%s/%s' % (class_id, suffix)
 
     def _passes_filter(self, obj):
         if obj.confidence < self.min_confidence:
@@ -947,7 +1100,11 @@ class CoordinateProjectorNode(Node):
         if now - self._last_3d_diagnostic_log_sec < self.diagnostic_3d_log_interval_sec:
             return
 
-        lines = ['3D_DIAG changed objects=%d' % len(entries)]
+        waist_q = np.asarray(getattr(self, '_last_waist_q', np.zeros(3)), dtype=np.float64)
+        lines = [
+            '3D_DIAG changed objects=%d waist_yaw_roll_pitch_rad=[%.5f %.5f %.5f]'
+            % (len(entries), float(waist_q[0]), float(waist_q[1]), float(waist_q[2]))
+        ]
         for identity, depth_source, _, obj in entries:
             camera = obj.point_camera
             target = obj.point_target
@@ -1016,7 +1173,11 @@ class CoordinateProjectorNode(Node):
         if self.T_cam2hand is not None:
             transformed = self._transform_eye_in_hand_with_pose(point_camera)
             if transformed is None:
-                message = 'camera_frame; eye_in_hand_unavailable: %s' % (self._fk_error or 'missing joints/FK')
+                return self._invalid_object(
+                    obj,
+                    header,
+                    'eye_in_hand_unavailable: %s' % (self._fk_error or 'missing joints/FK'),
+                )
             else:
                 point_object, T_base_hand = transformed
                 point_target, target_message = self._action_target_for_detection(obj, point_object, T_base_hand)
@@ -1024,9 +1185,28 @@ class CoordinateProjectorNode(Node):
                 message = 'eye_in_hand_fk; ' + target_message
         elif self.handeye_transform is not None:
             point_object = self._apply_transform(self.handeye_transform, point_camera)
-            point_target = point_object
+            joints = self._current_joint_values()
+            if not joints:
+                return self._invalid_object(
+                    obj,
+                    header,
+                    'eye_to_hand target compensation unavailable: missing joints',
+                )
+            try:
+                T_base_hand = self._compute_base_to_hand(joints)
+            except Exception as exc:
+                return self._invalid_object(
+                    obj,
+                    header,
+                    'eye_to_hand target compensation FK failed: %s' % exc,
+                )
+            point_target, target_message = self._action_target_for_detection(
+                obj,
+                point_object,
+                T_base_hand,
+            )
             target_frame = self.handeye_target_frame or self.target_frame or 'base_link'
-            message = 'handeye_npy'
+            message = 'eye_to_hand; ' + target_message
         elif self.target_frame:
             transformed = self._transform_point(point_camera, header.frame_id, self.target_frame)
             if transformed is None:
@@ -1076,7 +1256,9 @@ class CoordinateProjectorNode(Node):
         # A blue press point is a near-field eye-in-hand target. If its own
         # depth is missing, never substitute a multi-meter background surface.
         is_press = self._is_blue_point_detection(obj)
-        max_depth_m = self.max_depth_m
+        max_depth_m = min(self.max_depth_m, self.foreground_max_depth_m)
+        if self._is_handle_detection(obj):
+            max_depth_m = min(max_depth_m, self.handle_max_depth_m)
         if is_press:
             max_depth_m = min(max_depth_m, self.press_max_depth_m)
 
@@ -1100,11 +1282,6 @@ class CoordinateProjectorNode(Node):
 
         if is_press:
             if self._frame_handle_reference is not None:
-                fitted = self._fit_handle_plane_depth(obj, self._frame_handle_reference)
-                if fitted is not None:
-                    return fitted[0], 'handle_plane_fit', fitted[1]
-
-                # Conservative final fallback: scalar depth from the handle bbox.
                 handle = self._frame_handle_reference
                 handle_bbox = (
                     float(handle.xmin),
@@ -1112,15 +1289,27 @@ class CoordinateProjectorNode(Node):
                     float(handle.xmax),
                     float(handle.ymax),
                 )
-                sampled = self._sample_bbox_depth_m(
+                # Never fit a press-point plane from a YOLO handle that has no
+                # foreground depth support of its own. This prevents a distant
+                # false handle from pulling near random pixels into the fit.
+                sampled = self._sample_depth_m(
                     float(handle.cx),
                     float(handle.cy),
-                    handle_bbox,
-                    1.0,
                     max_depth_m=max_depth_m,
                 )
+                if sampled is None:
+                    sampled = self._sample_bbox_depth_m(
+                        float(handle.cx),
+                        float(handle.cy),
+                        handle_bbox,
+                        self.depth_roi_scale,
+                        max_depth_m=max_depth_m,
+                    )
                 if sampled is not None:
-                    return sampled[0], 'handle_plane_percentile', sampled[1]
+                    fitted = self._fit_handle_plane_depth(obj, handle)
+                    if fitted is not None:
+                        return fitted[0], 'handle_plane_fit', fitted[1]
+                    return sampled[0], 'handle_supported_percentile', sampled[1]
 
             # Never expand a press-point ROI into unrelated background. A
             # missing foreground depth must suppress the action target.
@@ -1346,7 +1535,10 @@ class CoordinateProjectorNode(Node):
             T_base_hand = self._compute_base_to_hand(joints)
         except Exception as exc:
             self._fk_error = 'FK failed: %s' % exc
-            self.get_logger().warn(self._fk_error)
+            now = time.monotonic()
+            if now - self._last_fk_warning_sec >= 1.0:
+                self._last_fk_warning_sec = now
+                self.get_logger().warn(self._fk_error)
             return None
         point_h = np.ones(4, dtype=np.float64)
         point_h[:3] = np.asarray(point_camera, dtype=np.float64).reshape(3)
@@ -1367,7 +1559,9 @@ class CoordinateProjectorNode(Node):
         mount_offset = np.asarray(self.handeye_mount_offset_from_wrist_xyz, dtype=np.float64).reshape(3)
         tip_from_mount = tip_from_wrist - mount_offset
         target = contact
-        if T_base_hand is not None:
+        if not self.apply_tip_compensation:
+            messages.append('dex1_tip_compensation=disabled')
+        elif T_base_hand is not None:
             rotation = np.asarray(T_base_hand, dtype=np.float64)[:3, :3]
             target = contact - rotation @ tip_from_mount
             messages.append('direct_copy_target')
@@ -1380,7 +1574,7 @@ class CoordinateProjectorNode(Node):
 
     def _apply_ground_ratio_to_red_sticker(self, detection):
         name = str(getattr(detection, 'class_name', '')).lower()
-        if 'red sticker push point' not in name:
+        if 'red sticker push point' not in name and 'lock point' not in name:
             return
         if self.T_cam2hand is None or self.latest_camera_info is None:
             return
@@ -1445,6 +1639,7 @@ class CoordinateProjectorNode(Node):
             or 'circle push point' in name
             or 'white square push point' in name
             or 'red sticker push point' in name
+            or 'lock point' in name
         )
 
     def _is_handle_detection(self, detection):
@@ -1491,11 +1686,35 @@ class CoordinateProjectorNode(Node):
             [float(joint_values.get(name, 0.0)) for name in H2_XR_DUAL_ARM_JOINTS],
             dtype=np.float64,
         )
-        left_pose, right_pose = self._xr_current_ee_poses(self._xr_ik, q)
+        waist_q = np.asarray(
+            [
+                0.0 if self.lock_waist else float(joint_values.get(name, 0.0))
+                for name in ('waist_yaw_joint', 'waist_roll_joint', 'waist_pitch_joint')
+            ],
+            dtype=np.float64,
+        )
+        self._last_waist_q = waist_q.copy()
+        left_pose, right_pose = self._xr_current_ee_poses(
+            self._xr_ik,
+            q,
+            waist_q,
+            reference_frame=self.base_link,
+        )
         pose = left_pose if self.hand_link.startswith('left_') else right_pose
         transform = np.eye(4, dtype=np.float64)
         transform[:3, :3] = np.asarray(pose.rotation, dtype=np.float64)
         transform[:3, 3] = np.asarray(pose.translation, dtype=np.float64).reshape(3)
+        if self.hand_link.endswith('wrist_yaw_link'):
+            # Kept configurable for compatibility with older H2 IK scripts.
+            # Current H2CompatibleIK places its control frame at wrist_yaw_link,
+            # so the configured offset is zero.
+            ee_offset = np.asarray(
+                self.xr_ee_offset_from_wrist_xyz,
+                dtype=np.float64,
+            ).reshape(3)
+            transform[:3, 3] = (
+                transform[:3, 3] - transform[:3, :3] @ ee_offset
+            )
         self.fk_backend_active = 'xr_pinocchio'
         self._fk_error = ''
         return transform
@@ -1610,6 +1829,12 @@ class CoordinateProjectorNode(Node):
             item = {
                 'object_id': self._object_id(index, object_3d.detection.class_name),
                 'class_name': str(object_3d.detection.class_name),
+                'label_text': str(getattr(object_3d.detection, 'label_text', '')),
+                'label_confidence': float(getattr(object_3d.detection, 'label_confidence', 0.0)),
+                'semantic_name': str(getattr(object_3d.detection, 'semantic_name', '')),
+                'control_id': str(getattr(object_3d.detection, 'control_id', '')),
+                'spatial_relation': str(getattr(object_3d.detection, 'spatial_relation', '')),
+                'label_tag_present': bool(getattr(object_3d.detection, 'label_tag_present', False)),
                 'class_id': int(object_3d.detection.class_id),
                 'confidence': float(object_3d.detection.confidence),
                 'bbox_xyxy': [

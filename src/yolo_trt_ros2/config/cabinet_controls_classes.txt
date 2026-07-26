@@ -16,3 +16,10 @@ yellow toggle switch
 red toggle switch
 white toggle switch
 round pressure gauge
+
+# Hang-tag / hook open-vocab prompts (MobileCLIP English).
+# Stable publish names are normalized in work_tag_detector:
+#   green work tag / red hang cord / cabinet hang hook
+green square work here safety tag
+red twisted hanging cord rope
+white adhesive cabinet wall hook

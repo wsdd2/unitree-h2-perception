@@ -422,7 +422,22 @@ INDEX_HTML = """<!doctype html>
       return name.includes("blue") ||
         name.includes("circle push point") ||
         name.includes("white square push point") ||
-        name.includes("red sticker push point");
+        name.includes("red sticker push point") ||
+        name.includes("lock point");
+    }
+
+    function isWorkTagGrasp(obj) {
+      const name = String(
+        (obj && (obj.class_name || (obj.detection && obj.detection.class_name))) || ""
+      ).toLowerCase();
+      return name.includes("work tag grasp");
+    }
+
+    function isHangHook(obj) {
+      const name = String(
+        (obj && (obj.class_name || (obj.detection && obj.detection.class_name))) || ""
+      ).toLowerCase();
+      return name.includes("cabinet hang hook");
     }
 
     function ikText(obj) {
@@ -535,7 +550,7 @@ INDEX_HTML = """<!doctype html>
 
         const label = document.createElement("div");
         label.className = "bbox-label";
-        label.textContent = `${obj.object_id || ""} ${obj.class_name} ${fmt(obj.confidence, 2)}`;
+        label.textContent = `${obj.object_id || ""} ${obj.semantic_name || obj.class_name} ${fmt(obj.confidence, 2)}`;
         div.appendChild(label);
 
         div.addEventListener("mousemove", ev => {
@@ -748,7 +763,7 @@ INDEX_HTML = """<!doctype html>
         }
         const objectRows = data.objects2d.objects.map(o => {
           const tr = document.createElement("tr");
-          [o.class_name, fmt(o.confidence, 2), `${o.xmin},${o.ymin},${o.xmax},${o.ymax}`, `${fmt(o.cx, 1)},${fmt(o.cy, 1)}`]
+          [o.semantic_name || o.class_name, fmt(o.confidence, 2), `${o.xmin},${o.ymin},${o.xmax},${o.ymax}`, `${fmt(o.cx, 1)},${fmt(o.cy, 1)}`]
             .forEach(text => {
               const td = document.createElement("td");
               td.className = "mono";
@@ -759,7 +774,11 @@ INDEX_HTML = """<!doctype html>
         });
         setRows(document.getElementById("objects2d"), objectRows, 4);
         const valid3d = data.objects3d.objects.filter(o => o.valid);
-        const best3d = valid3d.find(o => isBluePress(o)) || valid3d[0] || data.objects3d.objects[0];
+        const best3d = valid3d.find(o => isBluePress(o))
+          || valid3d.find(o => isWorkTagGrasp(o))
+          || valid3d.find(o => isHangHook(o))
+          || valid3d[0]
+          || data.objects3d.objects[0];
         const picked3d = data.pixel_query_result;
         document.getElementById("targetMeta").textContent =
           picked3d && picked3d.valid ? (picked3d.target_frame || "--") :
@@ -1308,6 +1327,12 @@ def object2d_to_dict(obj):
     source = str(getattr(obj, 'handle_grasp_source', ''))
     if source:
         payload['handle_grasp_source'] = source
+    payload['label_text'] = str(getattr(obj, 'label_text', ''))
+    payload['label_confidence'] = float(getattr(obj, 'label_confidence', 0.0))
+    payload['semantic_name'] = str(getattr(obj, 'semantic_name', ''))
+    payload['control_id'] = str(getattr(obj, 'control_id', ''))
+    payload['spatial_relation'] = str(getattr(obj, 'spatial_relation', ''))
+    payload['label_tag_present'] = bool(getattr(obj, 'label_tag_present', False))
     return payload
 
 
@@ -1387,6 +1412,12 @@ def dashboard_objects_to_dict(objects3d_msg, objects_ik_json):
         item = {
             'object_id': object_id,
             'class_name': str(det.class_name),
+            'label_text': str(getattr(det, 'label_text', '')),
+            'label_confidence': float(getattr(det, 'label_confidence', 0.0)),
+            'semantic_name': str(getattr(det, 'semantic_name', '')),
+            'control_id': str(getattr(det, 'control_id', '')),
+            'spatial_relation': str(getattr(det, 'spatial_relation', '')),
+            'label_tag_present': bool(getattr(det, 'label_tag_present', False)),
             'class_id': int(det.class_id),
             'confidence': float(det.confidence),
             'bbox_xyxy': [int(det.xmin), int(det.ymin), int(det.xmax), int(det.ymax)],

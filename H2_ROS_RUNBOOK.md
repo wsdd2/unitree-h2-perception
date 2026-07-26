@@ -105,10 +105,10 @@ Target compensation:
 
 - `dex1_tip_from_wrist_xyz: [0.14, 0.01, 0.012]` is the measured Dex1-1 fingertip position relative to `right_wrist_yaw_link`.
 - The ROS `point_target` is the desired Dex1-1 fingertip contact point in the target/world frame.
-- ROS IK uses `ik_end_effector_offset_xyz: [0.14, 0.01, 0.012]` to solve wrist/arm joints from that contact point.
+- ROS converts the contact point to a physical `right_wrist_yaw_link` target; the current IK control frame is the wrist itself.
 - Blue push points additionally apply `blue_point_target_world_offset_xyz: [0.0, 0.0, -0.004]`, so only the blue button target is moved 4 mm toward the ground.
 - `fk_backend: urdf` and `lock_waist: false` are intentional: waist joints from `rt/lf/lowstate` must be used, otherwise targets drift badly after lower-body/waist motion.
-- `handeye_mount_offset_from_wrist_xyz: [0.05, 0.0, 0.0]` only keeps the existing hand-eye calibration frame consistent; it is not the robot-side target.
+- `handeye_mount_offset_from_wrist_xyz` and `xr_ee_offset_from_wrist_xyz` are both zero for the new wrist-link calibration; no virtual 5 cm `R_ee` offset is used.
 
 Expected nodes:
 
@@ -266,7 +266,24 @@ Stage convention:
 3 grasp_or_pull_handle
 4 door_opened
 5 recover_or_abort
+6 pick_work_tag          # target = work tag grasp point
+7 hang_work_tag          # target = cabinet hang hook
 ```
+
+Hang-tag classes on `/detector/objects` / `/detector/objects_3d`:
+
+```text
+green work tag
+red hang cord
+work tag grasp point
+cabinet hang hook
+```
+
+Enable with `detect_work_tag: true` in `inspection_perception.yaml`.
+
+YOLOE prompts in `cabinet_controls_classes.txt` cover the tag/cord/hook;
+OpenCV still owns cord-apex / white-force geometry and refines the hook tip
+inside the YOLOE box when the semantic hook is present.
 
 Example:
 

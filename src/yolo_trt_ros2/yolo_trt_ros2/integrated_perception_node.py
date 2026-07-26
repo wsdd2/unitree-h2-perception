@@ -41,6 +41,7 @@ from yolo_trt_ros2.coordinate_projector_node import CoordinateProjectorNode
 import cv2
 import numpy as np
 import rclpy
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
@@ -49,6 +50,7 @@ from std_msgs.msg import Header
 
 from yolo_trt_ros2.web_dashboard_node import WebDashboardNode
 from yolo_trt_ros2.yolo_detector_node import YoloDetectorNode
+from yolo_trt_ros2.camera_info_utils import set_camera_info_intrinsics
 
 
 class IntegratedRealSenseNode(Node):
@@ -71,6 +73,12 @@ class IntegratedRealSenseNode(Node):
         self.depth_fps = int(self.get_parameter('depth_fps').value)
         self.cam_index = int(self.get_parameter('cam_index').value)
         self.cam_serial = str(self.get_parameter('cam_serial').value)
+        serial_override = str(self.get_parameter('camera_serial_override').value).strip()
+        index_override = int(self.get_parameter('camera_index_override').value)
+        if serial_override:
+            self.cam_serial = serial_override
+        if index_override >= 0:
+            self.cam_index = index_override
         self.frame_timeout_ms = int(self.get_parameter('frame_timeout_ms').value)
         self.publish_period_sec = float(self.get_parameter('publish_period_sec').value)
         self.restart_on_timeout_count = int(self.get_parameter('restart_on_timeout_count').value)
@@ -103,6 +111,12 @@ class IntegratedRealSenseNode(Node):
         self.declare_parameter('depth_fps', 30)
         self.declare_parameter('cam_index', 0)
         self.declare_parameter('cam_serial', '')
+        self.declare_parameter(
+            'camera_serial_override',
+            '',
+            ParameterDescriptor(dynamic_typing=True),
+        )
+        self.declare_parameter('camera_index_override', -1)
         self.declare_parameter('frame_timeout_ms', 1000)
         self.declare_parameter('publish_period_sec', 0.033)
         self.declare_parameter('restart_on_timeout_count', 30)
@@ -137,7 +151,12 @@ class IntegratedRealSenseNode(Node):
             _, _, self.camera_info = self.camera.color_intrinsics()
             self.timeout_count = 0
             self.get_logger().info(
-                'Integrated RealSense started: active=%s' % getattr(self.camera, 'active_config', {})
+                'Integrated RealSense started: requested_serial=%s fallback_index=%d active=%s'
+                % (
+                    self.cam_serial or '<empty>',
+                    self.cam_index,
+                    getattr(self.camera, 'active_config', {}),
+                )
             )
         except Exception as exc:
             self.camera = None
@@ -168,10 +187,14 @@ class IntegratedRealSenseNode(Node):
         ppx = float(info.get('ppx') or 0.0)
         ppy = float(info.get('ppy') or 0.0)
         msg.distortion_model = 'plumb_bob'
-        msg.d = [float(value) for value in info.get('coeffs', [0.0] * 5)]
-        msg.k = [fx, 0.0, ppx, 0.0, fy, ppy, 0.0, 0.0, 1.0]
-        msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
-        msg.p = [fx, 0.0, ppx, 0.0, 0.0, fy, ppy, 0.0, 0.0, 1.0, 0.0]
+        set_camera_info_intrinsics(
+            msg,
+            fx,
+            fy,
+            ppx,
+            ppy,
+            info.get('coeffs', [0.0] * 5),
+        )
         return msg
 
     def _capture_callback(self):

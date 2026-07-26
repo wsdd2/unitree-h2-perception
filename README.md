@@ -180,13 +180,14 @@ colcon build --packages-select yolo_trt_ros2
 coordinate_projector:
   ros__parameters:
     handeye_mode: eye-in-hand
-    handeye_target_frame: pelvis
-    base_link: pelvis
+    handeye_target_frame: torso_link
+    base_link: torso_link
     hand_link: right_wrist_yaw_link
     fk_backend: xr_pinocchio
-    lock_waist: true
+    lock_waist: false
 
-    handeye_mount_offset_from_wrist_xyz: [0.05, 0.0, 0.0]
+    handeye_mount_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
+    xr_ee_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
     dex1_tip_from_wrist_xyz: [0.14, 0.01, 0.012]
     blue_point_target_world_offset_xyz: [0.0, 0.0, -0.004]
 ```
@@ -196,7 +197,7 @@ coordinate_projector:
 - `dex1_tip_from_wrist_xyz` 是 Dex1-1 指尖/接触点相对 `right_wrist_yaw_link` 的实测偏移。
 - 蓝点会额外加 `blue_point_target_world_offset_xyz`，当前是世界 Z 方向向下 4mm。
 - `/detector/objects_3d[].point_target` 和网页复制点位是“机械臂可直接执行的目标点”，等价于直连脚本里的 `preferred_copy_target / ree_target_for_dex1_tip`。
-- ROS 内部 IK 使用 `handeye_mount_offset_from_wrist_xyz`，避免对已经补偿后的 copy target 再扣一次 Dex1 偏移。
+- 新标定和FK直接使用物理 `right_wrist_yaw_link`，不再使用前移5cm的虚拟 `R_ee`。
 
 ## 任务字段
 
@@ -278,6 +279,52 @@ handle_depth_near_delta_m: 0.015
 handle_depth_max_blue_distance_px: 180.0
 handle_depth_sticky_px: 45.0
 ```
+
+### Stage 6: 夹起工作吊牌
+
+开启配置：
+
+```yaml
+yolo_detector:
+  ros__parameters:
+    detect_work_tag: true
+```
+
+YOLOE prompts（`cabinet_controls_classes.txt`）已加入吊牌/挂钩语义；与 OpenCV 融合策略：
+
+```text
+green work tag / cabinet hang hook  -> 优先 YOLOE，挂钩尖点用 OpenCV 精修
+red hang cord / work tag grasp point -> 优先 OpenCV 几何（倒 V + 白色着力点）
+任一侧缺失时由另一侧补齐
+```
+
+检测类：
+
+```text
+green work tag          # 吊牌本体
+red hang cord           # 红色吊绳
+work tag grasp point    # 红线上白色着力点 / 绳环顶点（夹取目标）
+cabinet hang hook       # 柜面白色挂钩（挂靠目标）
+```
+
+运控发布：
+
+```text
+stage_id: 6
+stage_name: 'pick_work_tag'
+```
+
+此时 `/detector/target_point` 与 `/detector/target_pose` 切换为 `work tag grasp point`。
+也可直接在 `/detector/objects_3d` / `objects_ik_json` 中按 `class_name` 过滤。
+
+### Stage 7: 挂到挂钩
+
+```text
+stage_id: 7
+stage_name: 'hang_work_tag'
+```
+
+此时公共目标切换为 `cabinet hang hook` 的 `point_target`。
 
 ## 网页使用
 

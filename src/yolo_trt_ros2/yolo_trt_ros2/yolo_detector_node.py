@@ -11,6 +11,8 @@ from sensor_msgs.msg import Image
 
 from detector_msgs.msg import Object2D, Object2DArray
 from yolo_trt_ros2.backends.mock_backend import MockBackend
+from yolo_trt_ros2.control_label_ocr import ControlLabelOCR
+from yolo_trt_ros2.work_tag_detector import is_work_tag_class, merge_work_tag_detections
 
 
 class YoloDetectorNode(Node):
@@ -47,6 +49,7 @@ class YoloDetectorNode(Node):
         self.filter_prompt_free_handles = bool(self.get_parameter('filter_prompt_free_handles').value)
         self.mobileclip_path = str(self.get_parameter('mobileclip_path').value)
         self.detect_blue_point = bool(self.get_parameter('detect_blue_point').value)
+        self.detect_work_tag = bool(self.get_parameter('detect_work_tag').value)
         self.blue_point_class_name = str(self.get_parameter('blue_point_class_name').value)
         self.press_point_mode = str(self.get_parameter('press_point_mode').value).strip().lower()
         self.press_point_vertical_ratio = max(
@@ -55,6 +58,17 @@ class YoloDetectorNode(Node):
         )
         self.blue_point_min_area = float(self.get_parameter('blue_point_min_area').value)
         self.blue_point_max_area_ratio = float(self.get_parameter('blue_point_max_area_ratio').value)
+        self.lock_min_dark_surround_ratio = max(
+            0.0,
+            min(
+                1.0,
+                float(self.get_parameter('lock_min_dark_surround_ratio').value),
+            ),
+        )
+        self.lock_dark_value_max = max(
+            0,
+            min(255, int(self.get_parameter('lock_dark_value_max').value)),
+        )
         self.roi_mean_filter_enabled = bool(self.get_parameter('roi_mean_filter_enabled').value)
         self.roi_mean_filter_window = max(1, int(self.get_parameter('roi_mean_filter_window').value))
         self.roi_mean_filter_max_jump_px = max(
@@ -65,14 +79,56 @@ class YoloDetectorNode(Node):
             0,
             int(self.get_parameter('roi_mean_filter_max_missed').value),
         )
+        self.control_ocr_enabled = bool(self.get_parameter('control_ocr_enabled').value)
+        self.lock_overlap_suppression_enabled = bool(
+            self.get_parameter('lock_overlap_suppression_enabled').value
+        )
+        self.lock_overlap_suppression_padding_px = max(
+            0.0,
+            float(self.get_parameter('lock_overlap_suppression_padding_px').value),
+        )
+        self.handle_max_bbox_area_ratio = max(
+            0.01,
+            float(self.get_parameter('handle_max_bbox_area_ratio').value),
+        )
+        self.handle_max_bbox_height_ratio = max(
+            0.05,
+            float(self.get_parameter('handle_max_bbox_height_ratio').value),
+        )
         self.prompts = self._load_yoloe_classes(self.yoloe_classes_path)
+        self.published_class_names = self._load_text_list(
+            self.yoloe_classes_path,
+            'yoloe_classes_path',
+            include_publish_only=True,
+        )
+        if self.published_class_names:
+            self.get_logger().info(
+                'Canonical class registry contains %d prompt/generated names.'
+                % len(self.published_class_names)
+            )
         if not self.prompts:
             self.prompts = self._parse_list_value(self.get_parameter('prompts').value)
 
         self.bridge = CvBridge()
-        self._roi_mean_tracks = {'press': [], 'handle': []}
+        self._roi_mean_tracks = {'press': [], 'handle': [], 'work_tag': []}
         self.class_names = self._load_class_names(self.class_names_path)
         self.backend = self._create_backend()
+        self.control_ocr = ControlLabelOCR(
+            logger=self.get_logger(),
+            enabled=self.control_ocr_enabled,
+            backend=str(self.get_parameter('control_ocr_backend').value),
+            language=str(self.get_parameter('control_ocr_language').value),
+            dictionary_path=str(self.get_parameter('control_ocr_dictionary_path').value),
+            interval_frames=int(self.get_parameter('control_ocr_interval_frames').value),
+            min_confidence=float(self.get_parameter('control_ocr_min_confidence').value),
+            stable_frames=int(self.get_parameter('control_ocr_stable_frames').value),
+            max_missed=int(self.get_parameter('control_ocr_max_missed').value),
+            max_controls_per_frame=int(self.get_parameter('control_ocr_max_controls_per_frame').value),
+            roi_width_scale=float(self.get_parameter('control_ocr_roi_width_scale').value),
+            roi_height_scale=float(self.get_parameter('control_ocr_roi_height_scale').value),
+            row_alignment_tolerance_px=float(self.get_parameter('control_row_alignment_tolerance_px').value),
+            label_tag_brightness_delta=float(self.get_parameter('control_label_tag_brightness_delta').value),
+        )
 
         self.objects_pub = self.create_publisher(Object2DArray, self.objects_topic, 10)
         self.debug_pub = None
@@ -124,15 +180,35 @@ class YoloDetectorNode(Node):
         self.declare_parameter('filter_prompt_free_handles', False)
         self.declare_parameter('mobileclip_path', '')
         self.declare_parameter('detect_blue_point', False)
+        self.declare_parameter('detect_work_tag', False)
         self.declare_parameter('blue_point_class_name', 'blue circle push point')
         self.declare_parameter('press_point_mode', 'blue')
         self.declare_parameter('press_point_vertical_ratio', 0.5)
         self.declare_parameter('blue_point_min_area', 40.0)
         self.declare_parameter('blue_point_max_area_ratio', 0.02)
+        self.declare_parameter('lock_min_dark_surround_ratio', 0.28)
+        self.declare_parameter('lock_dark_value_max', 90)
         self.declare_parameter('roi_mean_filter_enabled', False)
         self.declare_parameter('roi_mean_filter_window', 3)
         self.declare_parameter('roi_mean_filter_max_jump_px', 40.0)
         self.declare_parameter('roi_mean_filter_max_missed', 2)
+        self.declare_parameter('control_ocr_enabled', False)
+        self.declare_parameter('control_ocr_backend', 'tesseract')
+        self.declare_parameter('control_ocr_language', 'chi_sim')
+        self.declare_parameter('control_ocr_dictionary_path', '')
+        self.declare_parameter('control_ocr_interval_frames', 6)
+        self.declare_parameter('control_ocr_min_confidence', 0.65)
+        self.declare_parameter('control_ocr_stable_frames', 3)
+        self.declare_parameter('control_ocr_max_missed', 30)
+        self.declare_parameter('control_ocr_max_controls_per_frame', 8)
+        self.declare_parameter('control_ocr_roi_width_scale', 2.6)
+        self.declare_parameter('control_ocr_roi_height_scale', 1.8)
+        self.declare_parameter('control_row_alignment_tolerance_px', 28.0)
+        self.declare_parameter('control_label_tag_brightness_delta', 18.0)
+        self.declare_parameter('lock_overlap_suppression_enabled', True)
+        self.declare_parameter('lock_overlap_suppression_padding_px', 8.0)
+        self.declare_parameter('handle_max_bbox_area_ratio', 0.12)
+        self.declare_parameter('handle_max_bbox_height_ratio', 0.65)
         self.declare_parameter(
             'prompts',
             'lever door handle,horizontal door handle,door lever handle,pull door handle',
@@ -154,7 +230,7 @@ class YoloDetectorNode(Node):
     def _load_class_names(self, class_names_path):
         return self._load_text_list(class_names_path, 'class_names_path')
 
-    def _load_text_list(self, path, label):
+    def _load_text_list(self, path, label, include_publish_only=False):
         if not path:
             return []
         expanded = os.path.expanduser(str(path))
@@ -170,6 +246,11 @@ class YoloDetectorNode(Node):
                     continue
                 if '#' in text:
                     text = text.split('#', 1)[0].strip()
+                publish_only = text.lower().startswith('publish:')
+                if publish_only:
+                    if not include_publish_only:
+                        continue
+                    text = text.split(':', 1)[1].strip()
                 for item in text.split(','):
                     name = item.strip()
                     if name:
@@ -236,6 +317,10 @@ class YoloDetectorNode(Node):
         except Exception as exc:
             self.get_logger().error('Backend inference failed: %s' % exc)
             return None, None
+        detections = self._filter_implausible_handle_boxes(
+            detections,
+            bgr_image.shape[:2],
+        )
         if self.detect_blue_point:
             # Legacy blue-marker mode: HSV owns the target and replaces any
             # model-native press detections.
@@ -245,6 +330,7 @@ class YoloDetectorNode(Node):
                 if not self._is_press_point_name(det.get('class_name', ''))
             ]
             detections = list(detections) + self._detect_press_point(bgr_image, detections)
+            detections = self._suppress_buttons_overlapping_lock(detections)
         else:
             # White-tape mode: keep the model detection but expose the physical
             # marker's actual color/shape semantics to downstream consumers.
@@ -257,8 +343,18 @@ class YoloDetectorNode(Node):
             fallback_handle = self._detect_black_handle(bgr_image, press)
             if fallback_handle is not None:
                 detections = list(detections) + [fallback_handle]
+        if self.detect_work_tag:
+            # Keep non-hang-tag YOLOE hits; fuse hang-tag YOLOE prompts with
+            # OpenCV cord/grasp geometry (YOLOE preferred for the hook).
+            model_keep = [
+                det
+                for det in detections
+                if not is_work_tag_class(det.get('class_name', ''))
+            ]
+            detections = list(model_keep) + merge_work_tag_detections(bgr_image, detections)
         detections = self._attach_handle_grasp_edges(bgr_image, detections)
         detections = self._smooth_detection_rois(detections)
+        detections = self.control_ocr.annotate(bgr_image, detections)
 
         objects_msg = self._build_objects_msg(header, detections)
         if publish_objects:
@@ -290,6 +386,12 @@ class YoloDetectorNode(Node):
             obj.handle_grasp_center_px = [float(v) for v in center_px]
             obj.handle_grasp_width_px = float(det.get('handle_grasp_width_px', 0.0))
             obj.handle_grasp_source = str(det.get('handle_grasp_source', ''))
+            obj.label_text = str(det.get('label_text', ''))
+            obj.label_confidence = float(det.get('label_confidence', 0.0))
+            obj.semantic_name = str(det.get('semantic_name', ''))
+            obj.control_id = str(det.get('control_id', ''))
+            obj.spatial_relation = str(det.get('spatial_relation', ''))
+            obj.label_tag_present = bool(det.get('label_tag_present', False))
             msg.objects.append(obj)
 
         return msg
@@ -301,13 +403,31 @@ class YoloDetectorNode(Node):
             xmax = int(det.get('xmax', 0))
             ymax = int(det.get('ymax', 0))
             class_name = str(det.get('class_name', 'unknown'))
+            display_name = str(det.get('semantic_name', '') or class_name)
             confidence = float(det.get('confidence', 0.0))
             cx = int(round(float(det.get('cx', float(xmin + xmax) * 0.5))))
             cy = int(round(float(det.get('cy', float(ymin + ymax) * 0.5))))
 
             is_press = self._is_press_point_name(class_name)
-            color = (255, 128, 0) if is_press else (0, 255, 0)
-            center_color = (255, 0, 0) if is_press else (0, 0, 255)
+            if is_work_tag_class(class_name):
+                if 'grasp' in class_name.lower():
+                    color = (0, 255, 255)
+                    center_color = (0, 255, 255)
+                elif 'hook' in class_name.lower():
+                    color = (255, 128, 0)
+                    center_color = (255, 128, 0)
+                elif 'cord' in class_name.lower():
+                    color = (0, 0, 255)
+                    center_color = (0, 0, 255)
+                else:
+                    color = (0, 200, 0)
+                    center_color = (0, 200, 0)
+            elif is_press:
+                color = (255, 128, 0)
+                center_color = (255, 0, 0)
+            else:
+                color = (0, 255, 0)
+                center_color = (0, 0, 255)
             cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
             cv2.circle(image, (cx, cy), 5, center_color, -1)
             edge_px = det.get('handle_grasp_edge_px') or []
@@ -327,7 +447,7 @@ class YoloDetectorNode(Node):
                     markerSize=22,
                     thickness=2,
                 )
-            label = '%s %.2f' % (class_name, confidence)
+            label = '%s %.2f' % (display_name, confidence)
             cv2.putText(
                 image,
                 label,
@@ -369,11 +489,62 @@ class YoloDetectorNode(Node):
             or 'circle push point' in name
             or 'white square push point' in name
             or 'red sticker push point' in name
+            or 'lock point' in name
         )
+
+    def _suppress_buttons_overlapping_lock(self, detections):
+        if not self.lock_overlap_suppression_enabled:
+            return list(detections)
+        lock_detections = [
+            det
+            for det in detections
+            if 'lock point' in str(det.get('class_name', '')).lower()
+        ]
+        if not lock_detections:
+            return list(detections)
+
+        kept = []
+        for det in detections:
+            name = str(det.get('class_name', '')).lower()
+            if 'push button' not in name:
+                kept.append(det)
+                continue
+            x1 = float(det.get('xmin', 0.0)) - self.lock_overlap_suppression_padding_px
+            y1 = float(det.get('ymin', 0.0)) - self.lock_overlap_suppression_padding_px
+            x2 = float(det.get('xmax', 0.0)) + self.lock_overlap_suppression_padding_px
+            y2 = float(det.get('ymax', 0.0)) + self.lock_overlap_suppression_padding_px
+            overlaps_lock = any(
+                x1 <= float(lock.get('cx', 0.0)) <= x2
+                and y1 <= float(lock.get('cy', 0.0)) <= y2
+                for lock in lock_detections
+            )
+            if not overlaps_lock:
+                kept.append(det)
+        return kept
 
     def _is_handle_detection(self, det):
         name = str(det.get('class_name', '')).lower()
         return any(token in name for token in ('handle', 'lever', 'pull', 'cabinet door'))
+
+    def _filter_implausible_handle_boxes(self, detections, image_shape):
+        image_h, image_w = int(image_shape[0]), int(image_shape[1])
+        image_area = max(1.0, float(image_w * image_h))
+        kept = []
+        for det in detections:
+            if not self._is_handle_detection(det):
+                kept.append(det)
+                continue
+            width = max(0.0, float(det.get('xmax', 0)) - float(det.get('xmin', 0)))
+            height = max(0.0, float(det.get('ymax', 0)) - float(det.get('ymin', 0)))
+            area_ratio = width * height / image_area
+            height_ratio = height / max(1.0, float(image_h))
+            if (
+                area_ratio > self.handle_max_bbox_area_ratio
+                or height_ratio > self.handle_max_bbox_height_ratio
+            ):
+                continue
+            kept.append(det)
+        return kept
 
     def _detect_black_handle(self, image, press, min_area=180.0):
         if image is None or image.size == 0:
@@ -449,7 +620,7 @@ class YoloDetectorNode(Node):
             for track in tracks:
                 track['missed'] += 1
 
-        used_tracks = {'press': set(), 'handle': set()}
+        used_tracks = {'press': set(), 'handle': set(), 'work_tag': set()}
         for det in detections:
             kind = self._roi_filter_kind(det)
             if kind is None:
@@ -498,6 +669,8 @@ class YoloDetectorNode(Node):
             return 'press'
         if self._is_handle_detection(det):
             return 'handle'
+        if is_work_tag_class(det.get('class_name', '')):
+            return 'work_tag'
         return None
 
     def _detection_center(self, det):
@@ -685,6 +858,15 @@ class YoloDetectorNode(Node):
 
                 gx1, gy1 = int(rx1 + x), int(ry1 + y)
                 gx2, gy2 = int(gx1 + w), int(gy1 + h)
+                dark_ratio = self._dark_surround_ratio(
+                    image,
+                    gx1,
+                    gy1,
+                    gx2,
+                    gy2,
+                )
+                if dark_ratio < self.lock_min_dark_surround_ratio:
+                    continue
                 cx = float(gx1 + gx2) * 0.5
                 cy = float(gy1) + float(h) * self.press_point_vertical_ratio
                 square_score = 1.0 - min(1.0, abs(1.0 - aspect))
@@ -701,6 +883,7 @@ class YoloDetectorNode(Node):
                             'ymax': gy2,
                             'cx': cx,
                             'cy': cy,
+                            'lock_dark_surround_ratio': float(dark_ratio),
                         },
                     )
                 )
@@ -708,6 +891,30 @@ class YoloDetectorNode(Node):
         if not candidates:
             return []
         return [max(candidates, key=lambda item: item[0])[1]]
+
+    def _dark_surround_ratio(self, image, x1, y1, x2, y2):
+        image_h, image_w = image.shape[:2]
+        box_w = max(4, int(x2 - x1))
+        box_h = max(4, int(y2 - y1))
+        pad = max(8, int(round(0.85 * max(box_w, box_h))))
+        rx1 = max(0, int(x1) - pad)
+        ry1 = max(0, int(y1) - pad)
+        rx2 = min(image_w, int(x2) + pad)
+        ry2 = min(image_h, int(y2) + pad)
+        if rx2 <= rx1 or ry2 <= ry1:
+            return 0.0
+        hsv = cv2.cvtColor(image[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2HSV)
+        surround = np.ones(hsv.shape[:2], dtype=bool)
+        ix1 = max(0, int(x1) - rx1)
+        iy1 = max(0, int(y1) - ry1)
+        ix2 = min(hsv.shape[1], int(x2) - rx1)
+        iy2 = min(hsv.shape[0], int(y2) - ry1)
+        surround[iy1:iy2, ix1:ix2] = False
+        count = int(np.count_nonzero(surround))
+        if count <= 0:
+            return 0.0
+        dark = (hsv[:, :, 2] <= self.lock_dark_value_max) & surround
+        return float(np.count_nonzero(dark)) / float(count)
 
     def _detect_white_square_point(self, image, detections):
         if image is None or image.size == 0:

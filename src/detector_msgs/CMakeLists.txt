@@ -11,6 +11,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Object2DArray.msg"
   "msg/Object3D.msg"
   "msg/Object3DArray.msg"
+  "msg/InspectionCommand.msg"
   "msg/RobotInspectionStatus.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )

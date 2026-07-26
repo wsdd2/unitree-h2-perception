@@ -69,7 +69,7 @@ class RobotPerceptionSubscriber(Node):
             ik = obj.get("ik") or {}
 
             # Stage 2: blue button. Use this target for pressing the blue point.
-            if "blue" in class_name:
+            if "blue" in class_name or "red sticker push point" in class_name:
                 self.get_logger().info(
                     "blue target id=%s xyz=%s ik_success=%s"
                     % (object_id, point_target, ik.get("success"))
@@ -89,6 +89,20 @@ class RobotPerceptionSubscriber(Node):
                     joint_values = ik.get("joint_values_rad", {})
                     # TODO(robot engineer): move gripper to this IK target, then close gripper.
                     self.get_logger().info("handle IK joints=%s" % joint_values)
+
+            # Stage 6: pick the hang tag by the white force point / cord apex.
+            if "work tag grasp" in class_name:
+                self.get_logger().info(
+                    "work-tag grasp id=%s xyz=%s ik_success=%s"
+                    % (object_id, point_target, ik.get("success"))
+                )
+
+            # Stage 7: hang the tag onto the cabinet hook.
+            if "cabinet hang hook" in class_name:
+                self.get_logger().info(
+                    "hang-hook id=%s xyz=%s ik_success=%s"
+                    % (object_id, point_target, ik.get("success"))
+                )
 
 
 def main() -> None:

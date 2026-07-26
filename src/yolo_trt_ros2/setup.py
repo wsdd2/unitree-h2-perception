@@ -17,6 +17,7 @@ setup(
             'config/detector.yaml',
             'config/inspection_perception.yaml',
             'config/cabinet_controls_classes.txt',
+            'config/control_labels_zh.txt',
             'config/yoloe_classes.example.txt',
         ]),
     ],
@@ -26,9 +27,12 @@ setup(
     maintainer_email='TODO@example.com',
     description='Lightweight ROS2 Foxy YOLO detector node for Jetson Orin NX.',
     license='Apache-2.0',
-    tests_require=['pytest'],
+    extras_require={
+        'test': ['pytest'],
+    },
     entry_points={
         'console_scripts': [
+            'cabinet_automation_node = yolo_trt_ros2.cabinet_automation_node:main',
             'direct_realsense_node = yolo_trt_ros2.direct_realsense_node:main',
             'integrated_perception_node = yolo_trt_ros2.integrated_perception_node:main',
             'yolo_detector_node = yolo_trt_ros2.yolo_detector_node:main',

@@ -15,7 +15,8 @@ direct_realsense:
     depth_height: 480
     depth_fps: 6
     cam_index: 0
-    cam_serial: ''
+    # Wrist D435 used by eye-in-hand calibration. Do not use USB enumeration order.
+    cam_serial: '346522074739'
     frame_timeout_ms: 1000
     publish_period_sec: 0.1667
     restart_on_timeout_count: 30
@@ -35,26 +36,53 @@ yolo_detector:
     prompt_free: false
     best_handle_only: false
     filter_prompt_free_handles: false
-    # Keep the red-sticker opening target while YOLOE also detects cabinet controls.
+    # The red physical sticker marks the cabinet lock force/contact point.
     detect_blue_point: true
-    blue_point_class_name: red sticker push point
+    blue_point_class_name: lock point
     press_point_mode: red_sticker
+    # OpenCV hang-tag stack: green body, red cord, white force/grasp, cabinet hook.
+    detect_work_tag: true
     # Detector publishes the geometric center; projector applies gravity direction.
     press_point_vertical_ratio: 0.50
     blue_point_min_area: 40.0
     blue_point_max_area_ratio: 0.02
+    # Lock marker must be surrounded by the black lock body; this rejects
+    # ordinary red push buttons on the gray panel.
+    lock_min_dark_surround_ratio: 0.28
+    lock_dark_value_max: 90
     # Three-frame trailing mean suppresses ROI jitter while limiting eye-in-hand lag.
     # Reset the history immediately when the raw center jumps more than 40 px.
     roi_mean_filter_enabled: true
     roi_mean_filter_window: 3
     roi_mean_filter_max_jump_px: 40.0
     roi_mean_filter_max_missed: 2
-    conf_thres: 0.08
+    # OCR runs only on small ROIs beside/below detected controls and falls
+    # back to visual class names when Tesseract/Chinese data is unavailable.
+    control_ocr_enabled: true
+    control_ocr_backend: tesseract
+    control_ocr_language: chi_sim
+    control_ocr_dictionary_path: /home/unitree/MscapeTech/Foxy_ROS/src/yolo_trt_ros2/config/control_labels_zh.txt
+    control_ocr_interval_frames: 6
+    control_ocr_min_confidence: 0.65
+    control_ocr_stable_frames: 3
+    control_ocr_max_missed: 30
+    control_ocr_max_controls_per_frame: 8
+    control_ocr_roi_width_scale: 2.6
+    control_ocr_roi_height_scale: 1.8
+    control_row_alignment_tolerance_px: 28.0
+    control_label_tag_brightness_delta: 18.0
+    # OpenCV lock marker wins over an overlapping YOLOE push-button false hit.
+    lock_overlap_suppression_enabled: true
+    lock_overlap_suppression_padding_px: 8.0
+    # Reject door-frame/background regions incorrectly detected as a handle.
+    handle_max_bbox_area_ratio: 0.12
+    handle_max_bbox_height_ratio: 0.65
+    conf_thres: 0.3
     iou_thres: 0.45
     imgsz: 640
     # Preserve the 1280x720 camera detail for small cabinet controls.
     # Ultralytics pads height to the model stride internally.
-    imgsz_height: 736
+    imgsz_height: 736 # why is 736 not 720? because the model stride is 32, so the height should be 736 to make the height divisible by 32
     imgsz_width: 1280
     device: ''
     # Standalone detector honors this value. Integrated perception additionally
@@ -78,23 +106,28 @@ coordinate_projector:
     robot_status_topic: /robot/inspection_status
     target_frame: ''
     handeye_mode: eye-in-hand
-    handeye_npy_path: /home/unitree/MscapeTech/Hand_Eye_Calib/outputs/eye_in_hand_20260630_150210.json
-    handeye_target_frame: pelvis
+    handeye_npy_path: /home/unitree/MscapeTech/Hand_Eye_Calib/eye_in_hand/outputs/eye_in_hand_20260726_115420.json
+    handeye_target_frame: torso_link
     robot_model: h2
     workspace_root: /home/unitree/MscapeTech
     urdf_path: /home/unitree/H2_joint_cartesian/third_party/xr_teleoperate/assets/h2/H2.urdf
-    base_link: pelvis
+    base_link: torso_link
     hand_link: right_wrist_yaw_link
     camera_link: ''
     network_interface: eth0
     domain_id: 0
     lowstate_topic: rt/lf/lowstate
     joint_json_path: ''
-    lock_waist: true
-    fk_backend: xr_pinocchio
+    # Lower-body controller may move the waist; use measured yaw/roll/pitch in FK.
+    lock_waist: false
+    fk_backend: xr_pinocchio # xr_pinocchio is a backend for FK calculation, the difference between xr_pinocchio and xr_teleoperate is that xr_pinocchio is more accurate and xr_teleoperate is more fast
     h2_xr_scripts_dir: /home/unitree/H2_joint_cartesian/scripts
-    handeye_mount_offset_from_wrist_xyz: [0.05, 0.0, 0.0]
-    dex1_tip_from_wrist_xyz: [0.12, 0.01, 0.012] # this vector means the distance from the wrist to the dex1 tip 如果偏左，要对y轴取负值
+    # New calibration hand frame is the physical right_wrist_yaw_link.
+    handeye_mount_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
+    # H2 Pinocchio control frame is now the physical wrist_yaw_link origin.
+    xr_ee_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
+    dex1_tip_from_wrist_xyz: [0.14, 0.01, 0.012] # distance from right_wrist_yaw_link to the Dex1 contact tip
+    apply_tip_compensation: true
     blue_point_target_world_offset_xyz: [0.0, 0.001, -0.004] # this vector means the distance from the world to the blue point target
     class_filter: ''
     # Match the detector threshold so low-confidence cabinet controls can
@@ -119,21 +152,27 @@ coordinate_projector:
     handle_mid_right_offset_m: 0.01
     # From the gravity-opposite sticker edge toward the ground-facing edge.
     press_point_ground_ratio: 0.80 # 0.8 means the press point is 80% down from the sticker's top edge
+    # Integrated RealSense already converts native depth units to uint16 mm.
+    # Therefore projector conversion must be exactly mm -> m.
     depth_scale: 0.001
     min_depth_m: 0.10
     max_depth_m: 5.0
+    # Operational detections must be foreground; pixel-query keeps its own limit.
+    foreground_max_depth_m: 1.20
+    handle_max_depth_m: 1.00
+    control_row_z_tolerance_m: 0.04
     pixel_query_max_depth_m: 1.2
     publish_invalid: false
     publish_target_pose: true
     target_pose_orientation_xyzw: [0.0, 0.0, 0.0, 1.0] # [0.0, 0.0, 0.0, 1.0] means no rotation
     publish_current_joint_state: true
-    # Do not solve expensive IK for every cabinet diagnostic object.
-    # The selected red-sticker target still uses target_joint_state.
-    publish_objects_ik_json: false
+    # Publish lock force point and handle two-side grasp geometry. Per-object
+    # IK stays disabled; the LowCmd worker performs the final execution IK.
+    publish_objects_ik_json: true
     publish_failed_ik_solution: false
     ik_target_link: right_wrist_yaw_link
     ik_active_joints: 'right_shoulder_pitch_joint,right_shoulder_roll_joint,right_shoulder_yaw_joint,right_elbow_joint,right_wrist_roll_joint,right_wrist_pitch_joint,right_wrist_yaw_joint'
-    ik_end_effector_offset_xyz: [0.05, 0.0, 0.0]
+    ik_end_effector_offset_xyz: [0.0, 0.0, 0.0]
     ik_target_position_offset_xyz: [0.0, 0.0, 0.0]
     ik_max_iterations: 120
     ik_tolerance_position: 0.005
@@ -142,7 +181,7 @@ coordinate_projector:
     ik_step_scale: 0.4
     ik_position_weight: 1.0
     ik_orientation_weight: 0.0
-    max_ik_objects: 24
+    max_ik_objects: 0
     # Cache aligned depth frames and match the detector's original color stamp.
     # YOLO inference can finish >0.5 s after capture; never use the newest,
     # unrelated depth frame just because the matching frame is older.
@@ -155,6 +194,30 @@ coordinate_projector:
     diagnostic_3d_log_enabled: true
     diagnostic_3d_log_interval_sec: 5.0
     diagnostic_3d_log_change_m: 0.001
+
+cabinet_automation:
+  ros__parameters:
+    # Launch must additionally set automation_execute:=true. Keep both gates
+    # false until dry-run class selection and target stability are verified.
+    execute_enabled: false
+    worker_host: 127.0.0.1
+    worker_port: 8765
+    objects_3d_topic: /detector/objects_3d
+    objects_ik_topic: /detector/objects_ik_json
+    inspection_command_topic: /robot/inspection_command
+    robot_status_topic: /robot/inspection_status
+    result_topic: /robot/cabinet_action_result_json
+    min_confidence: 0.20
+    stability_window: 5
+    stability_max_std_m: 0.003
+    target_max_age_sec: 0.40
+    press_approach_m: 0.06
+    press_hold_sec: 0.35
+    handle_preapproach_m: 0.10
+    move_duration_sec: 2.0
+    expected_target_frame: pelvis
+    require_status_reachable: true
+    status_max_age_sec: 3.0
 
 web_dashboard:
   ros__parameters:

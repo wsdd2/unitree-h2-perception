@@ -22,3 +22,9 @@ red toggle switch
 white toggle switch
 round pressure gauge
 circular analog gauge
+
+# Hang-tag / hook (normalized publish names in work_tag_detector):
+#   green work tag, red hang cord, cabinet hang hook
+green square work here safety tag
+red twisted hanging cord rope
+white adhesive cabinet wall hook

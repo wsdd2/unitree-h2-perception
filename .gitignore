@@ -62,3 +62,7 @@ src/yolo_trt_ros2/config/*.local.yaml
 src/yolo_trt_ros2/config/*.local.yml
 src/yolo_trt_ros2/config/*classes.private.txt
 src/yolo_trt_ros2/config/*prompts.private.txt
+
+# Local migration/export bundles and archives
+robotics_yolo_ros_export/
+*.[rR][aA][rR]

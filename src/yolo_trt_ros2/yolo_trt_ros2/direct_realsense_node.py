@@ -12,6 +12,8 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 
+from yolo_trt_ros2.camera_info_utils import set_camera_info_intrinsics
+
 
 class DirectRealSenseNode(Node):
     def __init__(self):
@@ -130,10 +132,7 @@ class DirectRealSenseNode(Node):
         ppy = float(info.get('ppy') or 0.0)
         coeffs = [float(v) for v in info.get('coeffs', [0.0, 0.0, 0.0, 0.0, 0.0])]
         msg.distortion_model = 'plumb_bob'
-        msg.d = coeffs
-        msg.k = [fx, 0.0, ppx, 0.0, fy, ppy, 0.0, 0.0, 1.0]
-        msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        msg.p = [fx, 0.0, ppx, 0.0, 0.0, fy, ppy, 0.0, 0.0, 0.0, 1.0, 0.0]
+        set_camera_info_intrinsics(msg, fx, fy, ppx, ppy, coeffs)
         return msg
 
     def _timer_callback(self):
