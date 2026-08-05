@@ -126,13 +126,12 @@ class H2CompatibleIK:
             # 这样 pin.rnea() 算出来的 tauff 会包含夹爪重力补偿。
             self._append_gripper_payload("left_wrist_yaw_joint")
             self._append_gripper_payload("right_wrist_yaw_joint")
-        # 末端控制点。官方 IK 示例也是在 wrist_yaw_joint 前方加一个 ee frame。
-        # 这里 0.05m 是腕关节到末端控制点的近似偏移。
+        # 末端控制点直接使用真实 wrist_yaw_joint 原点，不再前移到虚拟 R_ee(+0.05)。
         self.model.addFrame(
             pin.Frame(
                 "L_ee",
                 self.model.getJointId("left_wrist_yaw_joint"),
-                pin.SE3(np.eye(3), np.array([0.05, 0.0, 0.0])),
+                pin.SE3.Identity(),
                 pin.FrameType.OP_FRAME,
             )
         )
@@ -140,7 +139,7 @@ class H2CompatibleIK:
             pin.Frame(
                 "R_ee",
                 self.model.getJointId("right_wrist_yaw_joint"),
-                pin.SE3(np.eye(3), np.array([0.05, 0.0, 0.0])),
+                pin.SE3.Identity(),
                 pin.FrameType.OP_FRAME,
             )
         )

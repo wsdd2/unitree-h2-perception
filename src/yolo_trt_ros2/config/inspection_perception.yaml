@@ -42,6 +42,11 @@ yolo_detector:
     press_point_mode: red_sticker
     # OpenCV hang-tag stack: green body, red cord, white force/grasp, cabinet hook.
     detect_work_tag: true
+    # OpenCV ArUco markers → class_name aruco_tag_<ID>, center (cx,cy), 3D via projector.
+    detect_aruco: true
+    aruco_dictionary: DICT_6X6_250
+    aruco_confidence: 0.99
+    aruco_min_side_px: 8.0
     # Detector publishes the geometric center; projector applies gravity direction.
     press_point_vertical_ratio: 0.50
     blue_point_min_area: 40.0
@@ -85,6 +90,28 @@ yolo_detector:
     imgsz_height: 736 # why is 736 not 720? because the model stride is 32, so the height should be 736 to make the height divisible by 32
     imgsz_width: 1280
     device: ''
+    # Detector stack controls (CLI overrides YAML):
+    #   detector_mode:=yoloe | yoloseg | hybrid | seg_on_request
+    # or granular: enable_yoloe:=true/false + yolo_seg_run_mode:=off|always|on_request
+    detector_mode: 'hybrid'
+    enable_yoloe: true
+    # Closed-set YOLO26-seg. always=preview every frame; on_request=run only when
+    # InspectionCommand.requested_class_names overlaps SEG classes (saves GPU).
+    yolo_seg_run_mode: always
+    yolo_seg_enabled: true
+    yolo_seg_model_path: /home/unitree/MscapeTech/models/yolo26_seg_cabinet_best.pt
+    yolo_seg_priority_mode: on_request
+    yolo_seg_conf_thres: 0.25
+    yolo_seg_iou_thres: 0.45
+    yolo_seg_imgsz: 1280
+    yolo_seg_mask_smooth_ksize: 5
+    yolo_seg_mask_close_iters: 1
+    # lock point: 80% from anti-ground edge == near-ground 20% of mask height.
+    yolo_seg_lock_ground_ratio: 0.80
+    # OpenCV HSV color prefix for push button / toggle (red|green|yellow).
+    yolo_seg_opencv_color: true
+    yolo_seg_inspection_command_topic: /robot/inspection_command
+    yolo_seg_covered_classes: 'push button,rotary selector switch,rotary multiple selector switch,toggle switch,cabinet door handle,lock point,work tag,hang cord,hook'
     # Standalone detector honors this value. Integrated perception additionally
     # requires --webUI; without it no preview is drawn, encoded or published.
     publish_debug_image: true
@@ -124,21 +151,28 @@ coordinate_projector:
     h2_xr_scripts_dir: /home/unitree/H2_joint_cartesian/scripts
     # New calibration hand frame is the physical right_wrist_yaw_link.
     handeye_mount_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
-    # H2 Pinocchio control frame is now the physical wrist_yaw_link origin.
+    # FK control frame = physical wrist_yaw_link origin (no virtual R_ee +0.05).
     xr_ee_offset_from_wrist_xyz: [0.0, 0.0, 0.0]
-    dex1_tip_from_wrist_xyz: [0.14, 0.01, 0.012] # distance from right_wrist_yaw_link to the Dex1 contact tip
-    apply_tip_compensation: true
-    blue_point_target_world_offset_xyz: [0.0, 0.001, -0.004] # this vector means the distance from the world to the blue point target
+    # Publish contact point in torso_link; tip compensation left to arm control.
+    dex1_tip_from_wrist_xyz: [0.0, 0.0, 0.0]
+    apply_tip_compensation: false
+    blue_point_target_world_offset_xyz: [0.0, 0.0, 0.0]
+    # Fixed bias on all projected world points (torso_link), meters.
+    # Keep zero unless a consistent bias is verified on multiple points.
+    projected_world_offset_xyz: [0.0, 0.0, 0.0]
     class_filter: ''
     # Match the detector threshold so low-confidence cabinet controls can
     # still receive diagnostic 3D points.
     min_confidence: 0.08
+    # Optional: black-square side length (meters). >0 uses ArUco PnP for 3D;
+    # 0 keeps depth sampling at marker center (default).
+    aruco_marker_length_m: 0.0
     depth_radius: 3
     # Require a real local depth support; never accept one stray background pixel.
     depth_min_valid_count: 8
     depth_percentile: 50.0 # 35.0 means the depth percentile is 35%
-    # H2 eye-in-hand press marker is near-field; reject the observed 0.422 m background.
-    press_max_depth_m: 0.30 # 0.3 means 0.3 meters away from the camera
+    # Cabinet / lock / press working distance; reject farther background beyond 1m.
+    press_max_depth_m: 1.0
     depth_fallback: bbox
     depth_roi_scale: 0.55
     depth_expanded_roi_scale: 1.8
@@ -215,7 +249,7 @@ cabinet_automation:
     press_hold_sec: 0.35
     handle_preapproach_m: 0.10
     move_duration_sec: 2.0
-    expected_target_frame: pelvis
+    expected_target_frame: torso_link
     require_status_reachable: true
     status_max_age_sec: 3.0
 
@@ -238,3 +272,6 @@ web_dashboard:
     pixel_query_topic: /detector/pixel_query
     pixel_query_result_topic: /detector/pixel_query_result_json
     robot_status_topic: /robot/inspection_status
+    depth_scale: 0.001
+    depth_preview_min_m: 0.10
+    depth_preview_max_m: 1.0

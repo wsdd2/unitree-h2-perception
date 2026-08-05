@@ -1,0 +1,324 @@
+Vision Cook Book is all you need. 
+================================================================================
+
+思考……
+
+
+0. Quick Start
+--------------------------------------------------------------------------------
+
+  视觉启动机     : H2 PC2 本机（unitree）
+  ROS Domain     : ROS_DOMAIN_ID=42
+  本机 DDS       : 启动脚本里是 ROS_LOCALHOST_ONLY=1
+                   → 运控也必须在同一台 H2 上收 topic
+  Web 预览       : http://<H2外网IP>:8081/（脚本固定 web_port:=8081）
+  目标坐标系     : torso_link
+  视觉 tip 补偿  : 已关闭（apply_tip_compensation:=false，腕→尖端偏移由运控自己做）
+  默认检测栈     : Yoloseg only
+  
+ DETECTOR_MODE=yoloseg bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+
+如果你忽然想要看看open world detector ->
+DETECTOR_MODE=Hybrid bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+
+1. Full process
+--------------------------------------------------------------------------------
+
+SSH 登录 H2 后，新开一个干净终端（不要进 conda）：
+
+  # 1) 确认没有旧感知进程占相机
+  pkill -f inspection_perception || true
+  pkill -f integrated_perception || true
+  sleep 1
+
+  # 2) 一键启动（推荐）
+  bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+
+成功时日志大致应出现：
+  - RealSense / camera 打开成功
+  - YOLO / YOLOSeg 模型加载成功
+  - WebUI 监听（端口 8081）
+  - 不再疯狂刷错
+
+浏览器打开：
+  http://<H2-IP>:8081/
+   default: http://192.168.1.3:8081
+应能看到彩色预览、检测框 / SEG 轮廓、以及当前目标信息。
+PS: 
+如果要更换相机，
+可以使用rs-enumrate-devices -s 获取相机的serial number，随后
+sed -i 's/cam_serial:=346522074739/cam_serial:=<新序列号>/' ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh 
+使用这条命令快速替换相机序列号
+
+1.1 可选：只切检测模式
+
+一般不要改。确有需要时：
+
+  DETECTOR_MODE=hybrid bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+  # DETECTOR_MODE=yoloe | yoloseg | hybrid | seg_on_request
+
+联调默认用 yoloseg。
+
+
+1.2 运控进程环境（必须同 Domain）
+
+运控在同一台 H2 上启动前：
+
+  conda deactivate 2>/dev/null || true
+  unset PYTHONPATH
+  source /opt/ros/humble/setup.bash
+  # 若运控也依赖 detector_msgs / 工作空间包：
+  # source ~/MscapeTech/Foxy_ROS/install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=1
+  export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+重要：Domain / LOCALHOST 不一致 = 收不到任何视觉 topic，这不是视觉“挂了”。
+
+
+2. 运控可以订阅 / 发布什么
+--------------------------------------------------------------------------------
+
+2.1 主要订阅（感知 → 运控）
+
+  /detector/target_point
+      当前优先目标点（geometry_msgs/PointStamped，帧一般是 torso_link）
+  /detector/target_pose
+      目标位姿（如需姿态）
+  /detector/objects_3d
+      全部 3D 检测列表
+  /detector/objects_ik_json
+      调试用 JSON（含类名、坐标、SEG 几何等）
+  /detector/current_ee_point
+      感知侧 FK 当前腕点（对照用）
+
+快速自检：
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=1
+  source /opt/ros/humble/setup.bash
+  source ~/MscapeTech/Foxy_ROS/install/setup.bash
+
+  ros2 topic list | grep detector
+  ros2 topic hz /detector/target_point
+  ros2 topic echo /detector/target_point --once
+
+
+2.2 运控发布流程参考（运控 → 感知）
+
+完整合同见：ROBOT_CONTROL_STAGE_CLASS_CONTRACT_ZH.md
+联调最少需要：
+
+  /robot/inspection_status
+      机器人当前状态 / stage
+  /robot/inspection_command
+      告诉视觉本阶段要找什么
+
+常用字段：
+  - requested_class_names      : 希望找的类（可多个）
+  - active_target_class_name   : 当前要锁的目标类
+  - stage_id                   : 与 status 一致
+  - command_id                 : 同一请求保持不变；新请求才换新 id
+
+
+2.3 联调可用的 class_name
+
+  lock point
+  black cabinet door handle
+
+  red push button
+  green push button
+  yellow push button
+  black push button
+
+  black rotary selector switch
+  yellow toggle switch
+  red toggle switch
+  white toggle switch
+
+  green work tag
+  red hang cord
+  cabinet hang hook
+
+说明：
+  - YOLOSeg 对按钮 / toggle 会用 OpenCV 补 red / green / yellow 前缀。
+  - 请求 red push button 时，请确认网页上对应实例也是红色；
+    不要只发 push button ，却期望颜色语义。
+  - 同色多个控件靠 OCR semantic_name（如 green push button/启动），
+    细节见合同文档。
+
+
+2.4 坐标系与 tip（避免“视觉错了”误判）
+
+  - /detector/target_point：torso_link 下的接触/动作点
+    （当前视觉不做 Dex1 tip 前移）。
+  - 运控若控的是 right_ee_link（例如腕沿 X +0.205 m），
+    补偿在运控侧完成，不要要求视觉再加一遍。
+  - 手眼 / FK 帧是腕：right_wrist_yaw_link（无虚拟 R_ee +0.05）。
+
+
+
+
+3. Frequent Q&A
+--------------------------------------------------------------------------------
+
+Q1. 网页打不开 / 8081 拒绝连接
+
+  ss -lptn | grep 8081
+  ps aux | grep -E 'inspection_perception|integrated_perception' | grep -v grep
+
+处理：
+  1. 确认感知进程还在跑
+  2. 确认用的是 8081，不是旧文档里的 8080
+  3. 确认访问的是 H2 外网 IP，且与机器人同网段
+  4. 重启：
+     pkill -f inspection_perception
+     bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+
+
+Q2. ros2 topic list 看不到 /detector/*
+
+按顺序查：
+  1. 感知进程是否在同一台机器
+  2. echo $ROS_DOMAIN_ID → 必须是 42
+  3. echo $ROS_LOCALHOST_ONLY → 必须是 1（与启动脚本一致）
+  4. echo $RMW_IMPLEMENTATION → 建议 rmw_fastrtps_cpp
+  5. 是否误进了 conda：which python3 不应指向 conda
+
+
+Q3. 有画面但没有目标 / target_point 不更新
+
+  1. 网页上看该类是否被检出（框/SEG）
+  2. 是否发布了 /robot/inspection_command，且 requested_class_names 正确
+  3. 目标是否太远：柜内工作距离大约 < 1.0～1.2 m，太远会被深度门限丢掉
+  4. 深度是否异常：网页 depth 预览是否大片无效
+  5. 相机是否对准面板、是否严重反光/遮挡
+
+
+Q4. RealSense / 相机打不开
+
+  rs-enumerate-devices | head
+  # 脚本里相机序列号：346522074739
+
+处理：
+  1. USB 是否松动、是否被别的进程占用
+  2. pkill 旧感知后再启
+  3. 插拔相机后等几秒再启动
+
+
+Q5. 启动报 ModuleNotFoundError / em / conda 污染
+
+  conda deactivate
+  conda deactivate
+  unset PYTHONPATH
+  unset LD_LIBRARY_PATH
+  source /opt/ros/humble/setup.bash
+  source ~/MscapeTech/Foxy_ROS/install/setup.bash
+
+不要在 h1_arm 等 conda 环境里跑感知。
+
+
+Q6. 点偏了几厘米，但网页上像素点看起来对
+
+优先怀疑运控侧 tip / ee 补偿 / 接近方向，不是先改手眼：
+
+  - 视觉当前不做 tip 补偿
+  - 运控控 right_ee_link 时，腕→尖端偏移必须在运控参数里调
+  - 同一姿态下左右/上下/深浅分别对应 tip 的不同轴，不要一次乱改三项
+
+只有：网页像素就偏、或同类多个点系统性同一方向偏很多，才像视觉/手眼问题。
+
+
+Q7. 颜色按钮类名不对（红绿黄）
+
+  1. 网页 SEG 标签是否已是 red/green/yellow push button
+  2. 光照是否过曝导致颜色判错 → 稍调曝光/角度后再看
+  3. 请求名必须带颜色，例如 green push button
+
+
+Q8. 进程占着 GPU / 启动第二次失败
+
+  pkill -f inspection_perception || true
+  pkill -f integrated_perception || true
+  nvidia-smi   # 看是否还有残留 python 占显存
+
+再重新 start_perception_h2.sh。
+
+
+Q9. 需要临时只看 YOLOSeg / 只看 YOLOE
+
+  DETECTOR_MODE=yoloseg bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+  DETECTOR_MODE=yoloe   bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+
+排完问题后请回到 hybrid。
+
+
+4. 什么情况下才联系我
+--------------------------------------------------------------------------------
+
+5.1 先不要联系（运控/现场可自愈）
+
+  - Domain / LOCALHOST / 端口记错
+  - conda 环境污染
+  - 旧进程没杀干净、相机被占用
+  - 网页能检出，但戳点偏差 → 先调运控 tip
+  - class_name 写错、没发 inspection_command
+  - 目标太远、被遮挡、深度无效
+  - 网络 IP / 8081 访问问题
+
+
+5.2 可以联系（附带下面信息，否则无法远程判断）
+
+仅当自检清单都做过，且属于例如：
+
+  1. 标准脚本启动后持续崩溃，同环境重启仍必现
+  2. 网页预览正常，但检出结果明显错误（框/掩膜长期不在目标上）
+  3. 像素点对、且运控 tip 按约定补偿后，多点仍系统性偏差很大（怀疑手眼/FK）
+  4. 模型文件缺失 / 路径坏掉，且确认 ~/MscapeTech/models/ 下文件在
+
+联系时请一次性发齐：
+
+  1. 现象：一句话
+  2. 启动命令（是否改过 DETECTOR_MODE / 参数）
+  3. 终端最后 50 行日志
+  4. 网页截图（最好含目标框）
+  5. ros2 topic echo /detector/target_point --once
+  6. echo ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY / RMW
+  7. 运控请求的 class_name / stage_id
+  8. 是否已尝试：pkill 后重启、换角度、调 tip
+
+
+
+
+6. 相关文档（在本机，可以直接看） 根目录位于E:/MscapeTech/Foxy_ROS （wsl: /mnt/e/MscapeTech/Foxy_ROS）
+--------------------------------------------------------------------------------
+
+  Foxy_ROS/scripts/start_perception_h2.sh
+      正式一键启动参数
+
+  Foxy_ROS/ROBOT_CONTROL_STAGE_CLASS_CONTRACT_ZH.md
+      stage / class / command 约定
+
+  Foxy_ROS/H2_DEPLOYMENT_AND_BENCHMARK.md
+      部署与基准测试（偏视觉维护）
+
+  Foxy_ROS/src/yolo_trt_ros2/config/inspection_perception.yaml
+      详细参数（联调请勿随意改）
+
+  Foxy_ROS/运控联调_视觉启动与排障.md
+      本文 Markdown 版（内容同步）
+
+
+7. 运控侧“最小成功标准”
+--------------------------------------------------------------------------------
+
+同时满足即可认为视觉就绪，可以开始动作联调：
+
+  1. Web 8081 实时画面正常
+  2. 发布正确 inspection_command 后，目标类在画面上稳定出现
+  3. /detector/target_point 有更新，且坐标在柜前合理范围
+  4. 运控用自己的 tip 补偿后，接近方向正确（深浅/左右/上下可独立微调）
+
+以上，
+喵

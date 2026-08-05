@@ -9,10 +9,102 @@ from cv_bridge import CvBridge
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
-from detector_msgs.msg import Object2D, Object2DArray
+from detector_msgs.msg import InspectionCommand, Object2D, Object2DArray
 from yolo_trt_ros2.backends.mock_backend import MockBackend
 from yolo_trt_ros2.control_label_ocr import ControlLabelOCR
 from yolo_trt_ros2.work_tag_detector import is_work_tag_class, merge_work_tag_detections
+from yolo_trt_ros2.aruco_detector import (
+    detect_aruco_markers,
+    draw_aruco_overlays,
+    is_aruco_class,
+)
+from yolo_trt_ros2.yolo_seg_priority import (
+    DEFAULT_SEG_CLASS_NAMES,
+    YoloSegPriorityBackend,
+    any_requested_covered,
+    available_publish_class_names,
+    draw_yolo_seg_overlays,
+    merge_yolo_seg_priority,
+    requested_activates_seg,
+)
+
+_CJK_FONT_CANDIDATES = (
+    '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
+    '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf',
+    'C:/Windows/Fonts/msyh.ttc',
+    'C:/Windows/Fonts/simhei.ttf',
+)
+_CJK_FONT_CACHE = {}
+
+
+def _load_cjk_font(size_px):
+    key = int(size_px)
+    cached = _CJK_FONT_CACHE.get(key)
+    if cached is not None or key in _CJK_FONT_CACHE:
+        return cached
+    try:
+        from PIL import ImageFont
+    except ImportError:
+        _CJK_FONT_CACHE[key] = None
+        return None
+    for path in _CJK_FONT_CANDIDATES:
+        if not os.path.isfile(path):
+            continue
+        try:
+            font = ImageFont.truetype(path, key)
+            _CJK_FONT_CACHE[key] = font
+            return font
+        except Exception:
+            continue
+    _CJK_FONT_CACHE[key] = None
+    return None
+
+
+def _put_text_bgr(image, text, org, color, font_scale=0.6, thickness=2):
+    """Draw UTF-8 text; fall back to Hershey only for ASCII-only labels."""
+    text = str(text)
+    x, y = int(org[0]), int(org[1])
+    if text.isascii():
+        cv2.putText(
+            image,
+            text,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            float(font_scale),
+            color,
+            int(thickness),
+            cv2.LINE_AA,
+        )
+        return image
+    font = _load_cjk_font(max(14, int(round(32 * float(font_scale)))))
+    if font is None:
+        # OpenCV Hershey cannot render CJK; keep a readable ASCII fallback.
+        ascii_fallback = text.encode('ascii', errors='replace').decode('ascii')
+        cv2.putText(
+            image,
+            ascii_fallback,
+            (x, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            float(font_scale),
+            color,
+            int(thickness),
+            cv2.LINE_AA,
+        )
+        return image
+    from PIL import Image, ImageDraw
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_image)
+    # PIL uses top-left of text box; OpenCV putText uses baseline.
+    ascent, _descent = font.getmetrics()
+    fill = (int(color[2]), int(color[1]), int(color[0]))
+    draw.text((x, max(0, y - ascent)), text, font=font, fill=fill)
+    image[:, :, :] = cv2.cvtColor(np.asarray(pil_image), cv2.COLOR_RGB2BGR)
+    return image
 
 
 class YoloDetectorNode(Node):
@@ -50,6 +142,10 @@ class YoloDetectorNode(Node):
         self.mobileclip_path = str(self.get_parameter('mobileclip_path').value)
         self.detect_blue_point = bool(self.get_parameter('detect_blue_point').value)
         self.detect_work_tag = bool(self.get_parameter('detect_work_tag').value)
+        self.detect_aruco = bool(self.get_parameter('detect_aruco').value)
+        self.aruco_dictionary = str(self.get_parameter('aruco_dictionary').value).strip()
+        self.aruco_confidence = float(self.get_parameter('aruco_confidence').value)
+        self.aruco_min_side_px = float(self.get_parameter('aruco_min_side_px').value)
         self.blue_point_class_name = str(self.get_parameter('blue_point_class_name').value)
         self.press_point_mode = str(self.get_parameter('press_point_mode').value).strip().lower()
         self.press_point_vertical_ratio = max(
@@ -95,6 +191,48 @@ class YoloDetectorNode(Node):
             0.05,
             float(self.get_parameter('handle_max_bbox_height_ratio').value),
         )
+        self.detector_mode = str(self.get_parameter('detector_mode').value).strip().lower()
+        self.enable_yoloe = bool(self.get_parameter('enable_yoloe').value)
+        self.yolo_seg_run_mode = str(
+            self.get_parameter('yolo_seg_run_mode').value
+        ).strip().lower()
+        # Legacy flag: false forces SEG off unless detector_mode / run_mode says otherwise.
+        self.yolo_seg_enabled = bool(self.get_parameter('yolo_seg_enabled').value)
+        self.enable_yoloe, self.yolo_seg_run_mode = self._resolve_detector_stack(
+            self.detector_mode,
+            self.enable_yoloe,
+            self.yolo_seg_run_mode,
+            self.yolo_seg_enabled,
+        )
+        self.yolo_seg_enabled = self.yolo_seg_run_mode != 'off'
+        self.yolo_seg_model_path = str(self.get_parameter('yolo_seg_model_path').value)
+        self.yolo_seg_priority_mode = str(
+            self.get_parameter('yolo_seg_priority_mode').value
+        ).strip().lower()
+        self.yolo_seg_conf_thres = float(self.get_parameter('yolo_seg_conf_thres').value)
+        self.yolo_seg_iou_thres = float(self.get_parameter('yolo_seg_iou_thres').value)
+        self.yolo_seg_imgsz = int(self.get_parameter('yolo_seg_imgsz').value)
+        self.yolo_seg_mask_smooth_ksize = int(
+            self.get_parameter('yolo_seg_mask_smooth_ksize').value
+        )
+        self.yolo_seg_mask_close_iters = int(
+            self.get_parameter('yolo_seg_mask_close_iters').value
+        )
+        self.yolo_seg_lock_ground_ratio = float(
+            self.get_parameter('yolo_seg_lock_ground_ratio').value
+        )
+        self.yolo_seg_opencv_color = bool(
+            self.get_parameter('yolo_seg_opencv_color').value
+        )
+        self.yolo_seg_inspection_command_topic = str(
+            self.get_parameter('yolo_seg_inspection_command_topic').value
+        )
+        self.yolo_seg_covered_classes = self._parse_list_value(
+            self.get_parameter('yolo_seg_covered_classes').value
+        ) or list(DEFAULT_SEG_CLASS_NAMES)
+        self._requested_class_names = []
+        self._yolo_seg_backend = None
+        self._last_yolo_seg_detections = []
         self.prompts = self._load_yoloe_classes(self.yoloe_classes_path)
         self.published_class_names = self._load_text_list(
             self.yoloe_classes_path,
@@ -145,17 +283,61 @@ class YoloDetectorNode(Node):
                 # Keep only the newest frame instead of accumulating latency.
                 1,
             )
+        if self.yolo_seg_run_mode in ('always', 'on_request'):
+            if self.yolo_seg_run_mode == 'always':
+                self._ensure_yolo_seg_backend()
+            self.create_subscription(
+                InspectionCommand,
+                self.yolo_seg_inspection_command_topic,
+                self._inspection_command_callback,
+                10,
+            )
 
         self.get_logger().info(
-            'YOLO detector started: backend=%s, input=%s, objects_topic=%s, debug=%s'
+            'YOLO detector started: backend=%s, enable_yoloe=%s, yolo_seg_run_mode=%s, '
+            'yolo_seg_opencv_color=%s, detect_aruco=%s, detector_mode=%s, input=%s, '
+            'objects_topic=%s, debug=%s'
             % (
-                self.backend_name,
+                self.backend_name if self.enable_yoloe else 'skipped',
+                self.enable_yoloe,
+                self.yolo_seg_run_mode,
+                'ON' if self.yolo_seg_opencv_color else 'OFF',
+                'ON' if self.detect_aruco else 'OFF',
+                self.detector_mode or '<granular>',
                 self.image_topic if subscribe_image else 'in-process RGB',
                 self.objects_topic,
                 self.publish_debug_image,
             )
         )
+        if self.yolo_seg_enabled:
+            available = available_publish_class_names(
+                self.yolo_seg_covered_classes,
+                opencv_color_enabled=self.yolo_seg_opencv_color,
+            )
+            self.get_logger().info(
+                'YOLOSeg OpenCV color semantics: %s | available class names (%d): %s'
+                % (
+                    'ON' if self.yolo_seg_opencv_color else 'OFF',
+                    len(available),
+                    ', '.join(available),
+                )
+            )
 
+
+    def camera_callback(self, image_msg):
+        try:
+            bgr_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().error('Failed to convert ROS Image to OpenCV: %s' % exc)
+            return
+
+        self.process_frame(bgr_image, image_msg.header)
+        if debug_image is not None and self.debug_pub is not None:
+            debug_msg = self.bridge.cv2_to_imgmsg(debug_image, encoding='bgr8')
+            debug_msg.header = image_msg.header
+            self.debug_pub.publish(debug_msg)
+
+        return bgr_image
     def _declare_parameters(self):
         self.declare_parameter('image_topic', '/camera/color/image_raw')
         self.declare_parameter('objects_topic', '/detector/objects')
@@ -181,6 +363,10 @@ class YoloDetectorNode(Node):
         self.declare_parameter('mobileclip_path', '')
         self.declare_parameter('detect_blue_point', False)
         self.declare_parameter('detect_work_tag', False)
+        self.declare_parameter('detect_aruco', False)
+        self.declare_parameter('aruco_dictionary', 'DICT_6X6_250')
+        self.declare_parameter('aruco_confidence', 0.99)
+        self.declare_parameter('aruco_min_side_px', 8.0)
         self.declare_parameter('blue_point_class_name', 'blue circle push point')
         self.declare_parameter('press_point_mode', 'blue')
         self.declare_parameter('press_point_vertical_ratio', 0.5)
@@ -209,6 +395,27 @@ class YoloDetectorNode(Node):
         self.declare_parameter('lock_overlap_suppression_padding_px', 8.0)
         self.declare_parameter('handle_max_bbox_area_ratio', 0.12)
         self.declare_parameter('handle_max_bbox_height_ratio', 0.65)
+        # detector_mode shortcuts (override enable_yoloe / yolo_seg_run_mode when set):
+        #   yoloe | yoloseg | hybrid | seg_on_request
+        self.declare_parameter('detector_mode', '')
+        self.declare_parameter('enable_yoloe', True)
+        # off | always | on_request  (when to run YOLO-seg inference)
+        self.declare_parameter('yolo_seg_run_mode', 'always')
+        self.declare_parameter('yolo_seg_enabled', False)
+        self.declare_parameter('yolo_seg_model_path', '')
+        self.declare_parameter('yolo_seg_priority_mode', 'on_request')
+        self.declare_parameter('yolo_seg_conf_thres', 0.25)
+        self.declare_parameter('yolo_seg_iou_thres', 0.45)
+        self.declare_parameter('yolo_seg_imgsz', 1280)
+        self.declare_parameter('yolo_seg_mask_smooth_ksize', 5)
+        self.declare_parameter('yolo_seg_mask_close_iters', 1)
+        self.declare_parameter('yolo_seg_lock_ground_ratio', 0.80)
+        self.declare_parameter('yolo_seg_opencv_color', True)
+        self.declare_parameter('yolo_seg_inspection_command_topic', '/robot/inspection_command')
+        self.declare_parameter(
+            'yolo_seg_covered_classes',
+            ','.join(DEFAULT_SEG_CLASS_NAMES),
+        )
         self.declare_parameter(
             'prompts',
             'lever door handle,horizontal door handle,door lever handle,pull door handle',
@@ -258,6 +465,15 @@ class YoloDetectorNode(Node):
         return values
 
     def _create_backend(self):
+        if not self.enable_yoloe:
+            self.get_logger().info('Primary YOLOE/Ultralytics backend disabled (enable_yoloe:=false).')
+
+            class _EmptyBackend(object):
+                def infer(self, _bgr_image):
+                    return []
+
+            return _EmptyBackend()
+
         if self.backend_name == 'mock':
             return MockBackend(self.class_names)
 
@@ -297,6 +513,26 @@ class YoloDetectorNode(Node):
 
         raise ValueError('Unsupported backend: %s. Use mock, yoloe, yolo, ultralytics or tensorrt.' % self.backend_name)
 
+    def _resolve_detector_stack(self, detector_mode, enable_yoloe, run_mode, legacy_seg_enabled):
+        """Map CLI/yaml presets into (enable_yoloe, yolo_seg_run_mode)."""
+        presets = {
+            'yoloe': (True, 'off'),
+            'yoloseg': (False, 'always'),
+            'seg': (False, 'always'),
+            'hybrid': (True, 'always'),
+            'both': (True, 'always'),
+            'seg_on_request': (True, 'on_request'),
+            'on_request': (True, 'on_request'),
+        }
+        mode = str(detector_mode or '').strip().lower()
+        if mode in presets:
+            return presets[mode]
+
+        resolved_run = str(run_mode or '').strip().lower()
+        if resolved_run not in ('off', 'always', 'on_request'):
+            resolved_run = 'always' if bool(legacy_seg_enabled) else 'off'
+        return bool(enable_yoloe), resolved_run
+
     def _image_callback(self, image_msg):
         try:
             bgr_image = self.bridge.imgmsg_to_cv2(image_msg, desired_encoding='bgr8')
@@ -312,46 +548,65 @@ class YoloDetectorNode(Node):
 
     def process_frame(self, bgr_image, header, publish_objects=True):
         """Run detection on an in-memory BGR frame and publish only Object2D."""
-        try:
-            detections = self.backend.infer(bgr_image)
-        except Exception as exc:
-            self.get_logger().error('Backend inference failed: %s' % exc)
-            return None, None
-        detections = self._filter_implausible_handle_boxes(
-            detections,
-            bgr_image.shape[:2],
-        )
-        if self.detect_blue_point:
-            # Legacy blue-marker mode: HSV owns the target and replaces any
-            # model-native press detections.
-            detections = [
-                det
-                for det in detections
-                if not self._is_press_point_name(det.get('class_name', ''))
-            ]
-            detections = list(detections) + self._detect_press_point(bgr_image, detections)
-            detections = self._suppress_buttons_overlapping_lock(detections)
+        if self.enable_yoloe:
+            try:
+                detections = self.backend.infer(bgr_image)
+            except Exception as exc:
+                self.get_logger().error('Backend inference failed: %s' % exc)
+                return None, None
+            detections = self._filter_implausible_handle_boxes(
+                detections,
+                bgr_image.shape[:2],
+            )
+            if self.detect_blue_point:
+                # Legacy blue-marker mode: HSV owns the target and replaces any
+                # model-native press detections.
+                detections = [
+                    det
+                    for det in detections
+                    if not self._is_press_point_name(det.get('class_name', ''))
+                ]
+                detections = list(detections) + self._detect_press_point(bgr_image, detections)
+                detections = self._suppress_buttons_overlapping_lock(detections)
+            else:
+                # White-tape mode: keep the model detection but expose the physical
+                # marker's actual color/shape semantics to downstream consumers.
+                detections = [dict(det) for det in detections]
+                for det in detections:
+                    if self._is_press_point_name(det.get('class_name', '')):
+                        det['class_name'] = self.blue_point_class_name
+            if not any(self._is_handle_detection(det) for det in detections):
+                press = self._best_blue_detection(detections)
+                fallback_handle = self._detect_black_handle(bgr_image, press)
+                if fallback_handle is not None:
+                    detections = list(detections) + [fallback_handle]
+            if self.detect_work_tag:
+                # Keep non-hang-tag YOLOE hits; fuse hang-tag YOLOE prompts with
+                # OpenCV cord/grasp geometry (YOLOE preferred for the hook).
+                model_keep = [
+                    det
+                    for det in detections
+                    if not is_work_tag_class(det.get('class_name', ''))
+                ]
+                detections = list(model_keep) + merge_work_tag_detections(bgr_image, detections)
         else:
-            # White-tape mode: keep the model detection but expose the physical
-            # marker's actual color/shape semantics to downstream consumers.
-            detections = [dict(det) for det in detections]
-            for det in detections:
-                if self._is_press_point_name(det.get('class_name', '')):
-                    det['class_name'] = self.blue_point_class_name
-        if not any(self._is_handle_detection(det) for det in detections):
-            press = self._best_blue_detection(detections)
-            fallback_handle = self._detect_black_handle(bgr_image, press)
-            if fallback_handle is not None:
-                detections = list(detections) + [fallback_handle]
-        if self.detect_work_tag:
-            # Keep non-hang-tag YOLOE hits; fuse hang-tag YOLOE prompts with
-            # OpenCV cord/grasp geometry (YOLOE preferred for the hook).
-            model_keep = [
-                det
-                for det in detections
-                if not is_work_tag_class(det.get('class_name', ''))
-            ]
-            detections = list(model_keep) + merge_work_tag_detections(bgr_image, detections)
+            detections = []
+
+        detections = self._merge_yolo_seg_priority(bgr_image, detections)
+        if self.detect_aruco:
+            aruco_dets = detect_aruco_markers(
+                bgr_image,
+                dictionary_name=self.aruco_dictionary,
+                confidence=self.aruco_confidence,
+                min_side_px=self.aruco_min_side_px,
+            )
+            if aruco_dets:
+                # Drop any prior same-ID ArUco hits; OpenCV owns this family.
+                detections = [
+                    det
+                    for det in detections
+                    if not is_aruco_class(det.get('class_name', ''))
+                ] + list(aruco_dets)
         detections = self._attach_handle_grasp_edges(bgr_image, detections)
         detections = self._smooth_detection_rois(detections)
         detections = self.control_ocr.annotate(bgr_image, detections)
@@ -364,6 +619,92 @@ class YoloDetectorNode(Node):
         if self.publish_debug_image:
             debug_image = self._draw_debug_image(bgr_image.copy(), detections)
         return objects_msg, debug_image
+
+    def _inspection_command_callback(self, msg):
+        self._requested_class_names = [
+            str(value).strip()
+            for value in getattr(msg, 'requested_class_names', [])
+            if str(value).strip()
+        ]
+        active = str(getattr(msg, 'active_target_class_name', '') or '').strip()
+        if active and active not in self._requested_class_names:
+            self._requested_class_names.append(active)
+
+    def _ensure_yolo_seg_backend(self):
+        if self._yolo_seg_backend is not None:
+            return self._yolo_seg_backend
+        if not self.yolo_seg_model_path:
+            self.get_logger().warn('yolo_seg_enabled but yolo_seg_model_path is empty')
+            return None
+        try:
+            self._yolo_seg_backend = YoloSegPriorityBackend(
+                model_path=self.yolo_seg_model_path,
+                class_names=self.yolo_seg_covered_classes,
+                conf_thres=self.yolo_seg_conf_thres,
+                iou_thres=self.yolo_seg_iou_thres,
+                imgsz=self.yolo_seg_imgsz,
+                device=self.device,
+                mask_smooth_ksize=self.yolo_seg_mask_smooth_ksize,
+                mask_close_iters=self.yolo_seg_mask_close_iters,
+                lock_ground_ratio=self.yolo_seg_lock_ground_ratio,
+                enable_opencv_color=self.yolo_seg_opencv_color,
+                logger=self.get_logger(),
+            )
+            self.get_logger().info(
+                'YOLO-seg priority backend ready: %s mode=%s opencv_color=%s'
+                % (
+                    self.yolo_seg_model_path,
+                    self.yolo_seg_priority_mode,
+                    'ON' if self.yolo_seg_opencv_color else 'OFF',
+                )
+            )
+        except Exception as exc:
+            self.get_logger().error('Failed to init YOLO-seg priority backend: %s' % exc)
+            self._yolo_seg_backend = None
+        return self._yolo_seg_backend
+
+    def _active_yolo_seg_classes(self):
+        if self.yolo_seg_run_mode == 'on_request':
+            requested = list(self._requested_class_names)
+            return [
+                name
+                for name in self.yolo_seg_covered_classes
+                if requested_activates_seg(requested, name)
+            ]
+        return list(self.yolo_seg_covered_classes)
+
+    def _merge_yolo_seg_priority(self, bgr_image, detections):
+        self._last_yolo_seg_detections = []
+        if self.yolo_seg_run_mode == 'off':
+            return list(detections)
+        if self.yolo_seg_run_mode == 'on_request':
+            if not any_requested_covered(
+                self._requested_class_names,
+                self.yolo_seg_covered_classes,
+            ):
+                return list(detections)
+        active = self._active_yolo_seg_classes()
+        if not active:
+            return list(detections)
+        backend = self._ensure_yolo_seg_backend()
+        if backend is None:
+            return list(detections)
+        try:
+            seg_dets = backend.infer(bgr_image, active_seg_classes=active)
+        except Exception as exc:
+            self.get_logger().warn('YOLO-seg inference failed: %s' % exc)
+            return list(detections)
+        # Seg-only stack: publish every SEG hit. Hybrid: replace only requested families.
+        merge_mode = 'always' if not self.enable_yoloe else self.yolo_seg_priority_mode
+        merged, preview = merge_yolo_seg_priority(
+            detections,
+            seg_dets,
+            self._requested_class_names,
+            mode=merge_mode,
+        )
+        self._last_yolo_seg_detections = list(preview)
+        return merged
+
 
     def _build_objects_msg(self, header, detections):
         msg = Object2DArray()
@@ -392,6 +733,9 @@ class YoloDetectorNode(Node):
             obj.control_id = str(det.get('control_id', ''))
             obj.spatial_relation = str(det.get('spatial_relation', ''))
             obj.label_tag_present = bool(det.get('label_tag_present', False))
+            geom = det.get('geometric_center_px') or []
+            if len(geom) >= 2:
+                obj.geometric_center_px = [float(geom[0]), float(geom[1])]
             msg.objects.append(obj)
 
         return msg
@@ -409,7 +753,10 @@ class YoloDetectorNode(Node):
             cy = int(round(float(det.get('cy', float(ymin + ymax) * 0.5))))
 
             is_press = self._is_press_point_name(class_name)
-            if is_work_tag_class(class_name):
+            if is_aruco_class(class_name):
+                color = (255, 0, 255)
+                center_color = (255, 0, 255)
+            elif is_work_tag_class(class_name):
                 if 'grasp' in class_name.lower():
                     color = (0, 255, 255)
                     center_color = (0, 255, 255)
@@ -428,17 +775,18 @@ class YoloDetectorNode(Node):
             else:
                 color = (0, 255, 0)
                 center_color = (0, 0, 255)
-            cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
-            cv2.circle(image, (cx, cy), 5, center_color, -1)
+            if not is_aruco_class(class_name):
+                cv2.rectangle(image, (xmin, ymin), (xmax, ymax), color, 2)
+                cv2.circle(image, (cx, cy), 5, center_color, -1)
             edge_px = det.get('handle_grasp_edge_px') or []
-            if len(edge_px) == 2:
+            if len(edge_px) == 2 and not is_aruco_class(class_name):
                 p0 = (int(edge_px[0][0]), int(edge_px[0][1]))
                 p1 = (int(edge_px[1][0]), int(edge_px[1][1]))
                 cv2.line(image, p0, p1, (0, 0, 255), 3)
                 cv2.circle(image, p0, 5, (0, 255, 255), -1)
                 cv2.circle(image, p1, 5, (0, 255, 255), -1)
             center_px = det.get('handle_grasp_center_px') or []
-            if len(center_px) == 2:
+            if len(center_px) == 2 and not is_aruco_class(class_name):
                 cv2.drawMarker(
                     image,
                     (int(center_px[0]), int(center_px[1])),
@@ -447,17 +795,24 @@ class YoloDetectorNode(Node):
                     markerSize=22,
                     thickness=2,
                 )
+            if is_aruco_class(class_name):
+                continue
             label = '%s %.2f' % (display_name, confidence)
-            cv2.putText(
+            
+            if str(det.get('detection_source', '')).startswith('yoloseg') or str(
+                det.get('handle_grasp_source', '')
+            ).startswith('yoloseg'):
+                label = 'SEG ' + label
+            _put_text_bgr(
                 image,
                 label,
                 (xmin, max(0, ymin - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
                 color,
-                2,
-                cv2.LINE_AA,
+                font_scale=0.6,
+                thickness=2,
             )
+        draw_yolo_seg_overlays(image, list(detections) + list(self._last_yolo_seg_detections))
+        draw_aruco_overlays(image, detections)
         return image
 
     def _attach_handle_grasp_edges(self, image, detections):
@@ -467,6 +822,8 @@ class YoloDetectorNode(Node):
         blue = self._best_blue_detection(detections)
         for det in detections:
             if not self._is_handle_detection(det):
+                continue
+            if str(det.get('handle_grasp_source', '')).startswith('yoloseg'):
                 continue
             grasp = self._estimate_handle_grasp_edge(image, det, blue)
             if grasp:

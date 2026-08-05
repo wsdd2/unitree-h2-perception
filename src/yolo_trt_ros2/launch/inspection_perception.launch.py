@@ -21,6 +21,11 @@ def generate_launch_description():
         default_value='false',
         description='Enable the in-process HTTP WebUI and preview generation.',
     )
+    web_port_arg = DeclareLaunchArgument(
+        'web_port',
+        default_value='8080',
+        description='HTTP port for the WebUI when webUI:=true.',
+    )
     automation_arg = DeclareLaunchArgument(
         'automation',
         default_value='false',
@@ -73,23 +78,57 @@ def generate_launch_description():
     )
     dex1_tip_arg = DeclareLaunchArgument(
         'dex1_tip_from_wrist_xyz',
-        default_value='[0.14, 0.01, 0.012]',
+        default_value='[0.0, 0.0, 0.0]',
         description='Dex1-1 fingertip/contact point offset from right_wrist_yaw_link, meters.',
     )
     apply_tip_compensation_arg = DeclareLaunchArgument(
         'apply_tip_compensation',
-        default_value='true',
+        default_value='false',
         description='Apply Dex1 tip-to-control-frame target compensation.',
     )
     blue_point_offset_arg = DeclareLaunchArgument(
         'blue_point_target_world_offset_xyz',
-        default_value='[0.0, 0.001, -0.004]',
+        default_value='[0.0, 0.0, 0.0]',
         description='World-frame offset applied only to the lock force/contact point, meters.',
+    )
+    projected_world_offset_arg = DeclareLaunchArgument(
+        'projected_world_offset_xyz',
+        default_value='[0.0, 0.0, 0.0]',
+        description='Fixed bias added to all projected world points (torso/base), meters.',
     )
     handeye_mount_offset_arg = DeclareLaunchArgument(
         'handeye_mount_offset_from_wrist_xyz',
         default_value='[0.0, 0.0, 0.0]',
         description='Calibration hand-frame offset from wrist; zero for right_wrist_yaw_link calibration.',
+    )
+    detector_mode_arg = DeclareLaunchArgument(
+        'detector_mode',
+        default_value='hybrid',
+        description=(
+            'Detection stack preset: yoloe | yoloseg | hybrid | seg_on_request. '
+            'hybrid = YOLOE + YOLOSeg always; seg_on_request = YOLOE + SEG only when requested.'
+        ),
+    )
+    enable_yoloe_arg = DeclareLaunchArgument(
+        'enable_yoloe',
+        default_value='true',
+        description='Run the primary YOLOE/open-vocab detector.',
+    )
+    yolo_seg_run_mode_arg = DeclareLaunchArgument(
+        'yolo_seg_run_mode',
+        default_value='always',
+        description=(
+            'When to run closed-set YOLO-seg: off | always | on_request '
+            '(only if InspectionCommand.requested_class_names overlaps SEG classes).'
+        ),
+    )
+    yolo_seg_opencv_color_arg = DeclareLaunchArgument(
+        'yolo_seg_opencv_color',
+        default_value='true',
+        description=(
+            'Enable OpenCV HSV color semantics for YOLOSeg push button / toggle '
+            '(red|green|yellow prefixes).'
+        ),
     )
 
     # Global ROS parameter overrides are harmless for the other in-process
@@ -125,7 +164,21 @@ def generate_launch_description():
         '-p',
         ['blue_point_target_world_offset_xyz:=', LaunchConfiguration('blue_point_target_world_offset_xyz')],
         '-p',
+        ['projected_world_offset_xyz:=', LaunchConfiguration('projected_world_offset_xyz')],
+        '-p',
         ['handeye_mount_offset_from_wrist_xyz:=', LaunchConfiguration('handeye_mount_offset_from_wrist_xyz')],
+        '-p',
+        ['web_port:=', LaunchConfiguration('web_port')],
+        '-p',
+        ['web_dashboard.web_port:=', LaunchConfiguration('web_port')],
+        '-p',
+        ["detector_mode:='", LaunchConfiguration('detector_mode'), "'"],
+        '-p',
+        ['enable_yoloe:=', LaunchConfiguration('enable_yoloe')],
+        '-p',
+        ["yolo_seg_run_mode:='", LaunchConfiguration('yolo_seg_run_mode'), "'"],
+        '-p',
+        ['yolo_seg_opencv_color:=', LaunchConfiguration('yolo_seg_opencv_color')],
     ]
     process_env = {
         'LD_LIBRARY_PATH': [
@@ -169,6 +222,7 @@ def generate_launch_description():
     return LaunchDescription([
         config_arg,
         web_ui_arg,
+        web_port_arg,
         automation_arg,
         automation_execute_arg,
         confidence_arg,
@@ -182,7 +236,12 @@ def generate_launch_description():
         dex1_tip_arg,
         apply_tip_compensation_arg,
         blue_point_offset_arg,
+        projected_world_offset_arg,
         handeye_mount_offset_arg,
+        detector_mode_arg,
+        enable_yoloe_arg,
+        yolo_seg_run_mode_arg,
+        yolo_seg_opencv_color_arg,
         integrated_node,
         integrated_node_with_web,
         automation_node,

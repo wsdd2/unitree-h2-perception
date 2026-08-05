@@ -19,3 +19,7 @@ string semantic_name
 string control_id
 string spatial_relation
 bool label_tag_present
+
+# Optional YOLO-seg smoothed-mask geometric center [u, v] in image pixels.
+# Action target remains (cx, cy); web copy prefers this center when present.
+float32[] geometric_center_px

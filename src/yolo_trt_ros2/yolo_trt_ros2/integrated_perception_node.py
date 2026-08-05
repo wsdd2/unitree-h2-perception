@@ -51,6 +51,10 @@ from std_msgs.msg import Header
 from yolo_trt_ros2.web_dashboard_node import WebDashboardNode
 from yolo_trt_ros2.yolo_detector_node import YoloDetectorNode
 from yolo_trt_ros2.camera_info_utils import set_camera_info_intrinsics
+from yolo_trt_ros2.perception_singleton import (
+    PerceptionAlreadyRunningError,
+    assert_no_conflicting_perception,
+)
 
 
 class IntegratedRealSenseNode(Node):
@@ -258,8 +262,10 @@ class IntegratedRealSenseNode(Node):
         self.projector.ingest_depth(depth, objects_msg.header.stamp)
         self.detector.objects_pub.publish(objects_msg)
         self.projector.process_objects(objects_msg)
-        if self.web_dashboard is not None and debug_image is not None:
-            self.web_dashboard.ingest_bgr_image(debug_image, objects_msg.header)
+        if self.web_dashboard is not None:
+            if debug_image is not None:
+                self.web_dashboard.ingest_bgr_image(debug_image, objects_msg.header)
+            self.web_dashboard.ingest_depth(depth)
 
     def destroy_node(self):
         if self.camera is not None:
@@ -282,9 +288,39 @@ def _parse_app_args(argv):
     return options, clean_argv
 
 
+def _web_port_from_argv(argv):
+    """Best-effort parse of `-p web_port:=8081` before nodes declare params."""
+    tokens = [str(item) for item in argv]
+    for index, token in enumerate(tokens):
+        if token.startswith('web_port:='):
+            value = token.split(':=', 1)[1].strip().strip("'\"")
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        if token in ('-p', '--param') and index + 1 < len(tokens):
+            nxt = tokens[index + 1]
+            if nxt.startswith('web_port:='):
+                value = nxt.split(':=', 1)[1].strip().strip("'\"")
+                try:
+                    return int(value)
+                except ValueError:
+                    return None
+    return None
+
+
 def main(args=None):
     argv = list(sys.argv if args is None else args)
     options, ros_argv = _parse_app_args(argv)
+    web_port = _web_port_from_argv(ros_argv) if options.webUI else None
+    if options.webUI and web_port is None:
+        web_port = 8081
+    try:
+        assert_no_conflicting_perception(web_port=web_port)
+    except PerceptionAlreadyRunningError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2) from exc
+
     rclpy.init(args=ros_argv)
 
     nodes = []

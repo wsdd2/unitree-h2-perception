@@ -222,7 +222,7 @@ class ControlLabelOCR:
             det
             for det in detections
             if str(det.get('class_name', '')).lower()
-            in ('red push button', 'green push button')
+            in ('red push button', 'green push button', 'yellow push button')
         ]
         row_model = None
         if len(buttons) >= 2:

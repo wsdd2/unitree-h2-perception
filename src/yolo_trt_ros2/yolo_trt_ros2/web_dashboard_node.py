@@ -128,6 +128,41 @@ INDEX_HTML = """<!doctype html>
       background: #050708;
       overflow: hidden;
     }
+    .depth-wrap {
+      border-top: 1px solid var(--line);
+      background: #050708;
+    }
+    .depth-preview {
+      position: relative;
+      width: min(480px, 42%);
+      max-width: 100%;
+      margin: 0;
+      background: #050708;
+      overflow: hidden;
+      cursor: crosshair;
+    }
+    .depth-preview .video {
+      width: 100%;
+      height: auto;
+      display: block;
+      image-rendering: auto;
+    }
+    #depthTooltip {
+      position: absolute;
+      z-index: 16;
+      display: none;
+      min-width: 140px;
+      padding: 6px 8px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      background: rgba(13,17,21,.96);
+      color: var(--text);
+      white-space: pre-wrap;
+      pointer-events: none;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      line-height: 1.35;
+    }
     .preview.pick-mode,
     .preview.pick-mode .bbox,
     .preview.pick-mode .grasp-point,
@@ -313,6 +348,16 @@ INDEX_HTML = """<!doctype html>
         <div id="overlay"></div>
         <div id="warning"></div>
       </div>
+      <div class="depth-wrap">
+        <div class="section-head">
+          <span>depth preview</span>
+          <span id="depthMeta" class="mono">hover for depth (m / mm)</span>
+        </div>
+        <div id="depthPreview" class="depth-preview">
+          <img id="depthStream" class="video" src="/depth.mjpg" alt="depth preview stream">
+          <div id="depthTooltip"></div>
+        </div>
+      </div>
     </section>
     <div class="side">
       <section>
@@ -357,6 +402,8 @@ INDEX_HTML = """<!doctype html>
     let pendingPickRequestId = null;
     let handledPickRequestId = null;
     let lastPickedPixel = null;
+    let depthHoverTimer = null;
+    let lastDepthSampleKey = "";
 
     function iou(a, b) {
       const ix1 = Math.max(a[0], b[0]);
@@ -556,13 +603,15 @@ INDEX_HTML = """<!doctype html>
         div.addEventListener("mousemove", ev => {
           const tooltip = document.getElementById("tooltip");
           if (stable) {
-            const copyHint = isBluePress(obj)
-              ? "click to copy blue press target"
-              : ((obj.handle_mid_right_air_target_m || obj.handle_grasp_ree_target_m)
-                  ? "click to copy explicit handle grasp target"
-                  : (obj.point_torso_m
-                      ? "double click to copy object center"
-                      : "3D point unavailable"));
+            const copyHint = obj.seg_geometric_center_target_m
+              ? "click to copy SEG geometric center"
+              : (isBluePress(obj)
+                ? "click to copy blue press target"
+                : ((obj.handle_mid_right_air_target_m || obj.handle_grasp_ree_target_m)
+                    ? "click to copy explicit handle grasp target"
+                    : (obj.point_torso_m
+                        ? "double click to copy object center"
+                        : "3D point unavailable")));
             tooltip.textContent =
               `${label.textContent}\\nworld ${coordText(obj)}\\n${obj.message || ""}\\n${ikText(obj)}\\n${copyHint}`;
           } else {
@@ -579,28 +628,38 @@ INDEX_HTML = """<!doctype html>
         div.addEventListener("click", async () => {
           if (!stable) return;
           let text = "";
-          if (isBluePress(obj) && obj.point_torso_m) {
+          let kind = "";
+          if (obj.seg_geometric_center_target_m) {
+            text = xyzText(obj.seg_geometric_center_target_m);
+            kind = "SEG geometric center";
+          } else if (isBluePress(obj) && obj.point_torso_m) {
             text = coordText(obj);
+            kind = "press target";
           } else {
             const handleTarget = obj.handle_mid_right_air_target_m || obj.handle_grasp_ree_target_m;
             if (handleTarget) {
               text = xyzText(handleTarget);
+              kind = "handle target";
             } else if (obj.point_torso_m) {
               text = coordText(obj);
+              kind = "object center";
             } else {
               return;
             }
           }
           await copyText(text);
           const copy = document.getElementById("copy");
-          copy.textContent = `copied ${text}`;
+          copy.textContent = `copied ${kind} ${text}`;
           setTimeout(() => { copy.textContent = ""; }, 1800);
         });
         div.addEventListener("dblclick", async ev => {
           ev.stopPropagation();
           let text = "";
           let targetKind = "";
-          if (isBluePress(obj) && obj.point_torso_m) {
+          if (obj.seg_geometric_center_target_m) {
+            text = xyzText(obj.seg_geometric_center_target_m);
+            targetKind = "SEG geometric center";
+          } else if (isBluePress(obj) && obj.point_torso_m) {
             text = coordText(obj);
             targetKind = "press target";
           } else {
@@ -654,6 +713,18 @@ INDEX_HTML = """<!doctype html>
           });
           overlay.appendChild(marker);
         });
+
+        const geom = obj.geometric_center_px || [];
+        if (geom.length === 2) {
+          const geomMarker = document.createElement("div");
+          geomMarker.className = "grasp-center";
+          geomMarker.style.left = `${geom[0] * sx}px`;
+          geomMarker.style.top = `${geom[1] * sy}px`;
+          geomMarker.style.color = "#ffe066";
+          geomMarker.textContent = "G";
+          geomMarker.title = "SEG geometric center";
+          overlay.appendChild(geomMarker);
+        }
 
         const center = obj.handle_grasp_center_px || [];
         if (center.length === 2) {
@@ -750,6 +821,12 @@ INDEX_HTML = """<!doctype html>
         dot.className = "dot " + (age < 1.5 ? "ok" : age < 5 ? "warn" : "");
         document.getElementById("status").textContent = `age ${fmt(age, 2)}s objects=${(data.objects || []).length}`;
         document.getElementById("imageMeta").textContent = `${data.image.width || "--"}x${data.image.height || "--"} q=${data.image.jpeg_quality}`;
+        const depth = data.depth || {};
+        const validPct = Number.isFinite(depth.valid_ratio) ? (100.0 * depth.valid_ratio).toFixed(1) : "--";
+        document.getElementById("depthMeta").textContent =
+          depth.width
+            ? `${depth.width}x${depth.height} valid=${validPct}% scale=${fmt(depth.depth_scale, 4)} hover for m/mm`
+            : "waiting for depth";
         document.getElementById("objectMeta").textContent = `${data.objects2d.objects.length} objects`;
         renderOverlay(data);
         const pickResult = data.pixel_query_result;
@@ -902,6 +979,48 @@ INDEX_HTML = """<!doctype html>
         setPick3dMode(false);
       }
     });
+
+    async function sampleDepthAtEvent(ev) {
+      const img = document.getElementById("depthStream");
+      const tip = document.getElementById("depthTooltip");
+      const rect = img.getBoundingClientRect();
+      if (rect.width <= 1 || rect.height <= 1) return;
+      const nx = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+      const ny = Math.max(0, Math.min(1, (ev.clientY - rect.top) / rect.height));
+      const key = nx.toFixed(3) + "," + ny.toFixed(3);
+      tip.style.left = Math.min(rect.width - 8, Math.max(8, ev.clientX - rect.left + 12)) + "px";
+      tip.style.top = Math.min(rect.height - 8, Math.max(8, ev.clientY - rect.top + 12)) + "px";
+      tip.style.display = "block";
+      if (key === lastDepthSampleKey) return;
+      lastDepthSampleKey = key;
+      tip.textContent = "sampling...";
+      try {
+        const res = await fetch("/api/depth_sample?nx=" + nx.toFixed(4) + "&ny=" + ny.toFixed(4), { cache: "no-store" });
+        const data = await res.json();
+        if (!data.ok) {
+          tip.textContent = data.message || "no depth";
+          return;
+        }
+        tip.textContent =
+          "u=" + data.u + " v=" + data.v + "\\n" +
+          "depth=" + fmt(data.depth_m, 4) + " m\\n" +
+          "raw=" + data.raw_mm + " mm\\n" +
+          (data.valid ? "VALID" : "HOLE / INVALID");
+      } catch (err) {
+        tip.textContent = "depth sample failed";
+      }
+    }
+
+    document.getElementById("depthPreview").addEventListener("mousemove", (ev) => {
+      if (depthHoverTimer) clearTimeout(depthHoverTimer);
+      depthHoverTimer = setTimeout(() => sampleDepthAtEvent(ev), 40);
+    });
+    document.getElementById("depthPreview").addEventListener("mouseleave", () => {
+      if (depthHoverTimer) clearTimeout(depthHoverTimer);
+      document.getElementById("depthTooltip").style.display = "none";
+      lastDepthSampleKey = "";
+    });
+
     setInterval(refresh, 300);
     refresh();
   </script>
@@ -934,6 +1053,7 @@ class DashboardState:
     def __init__(self):
         self.lock = threading.Lock()
         self.frame_condition = threading.Condition(self.lock)
+        self.depth_condition = threading.Condition(self.lock)
         self.jpeg = make_status_jpeg(
             'Waiting for ROS image topic: /detector/debug_image\n'
             'If this stays here, check camera publisher and yolo_detector_node logs.'
@@ -942,6 +1062,19 @@ class DashboardState:
         self.image_width = 0
         self.image_height = 0
         self.jpeg_quality = 80
+        self.depth_jpeg = make_status_jpeg(
+            'Waiting for depth preview\n'
+            'Enabled only when webUI=true and RealSense depth is flowing.',
+            width=640,
+            height=480,
+        )
+        self.depth_raw = None
+        self.depth_width = 0
+        self.depth_height = 0
+        self.depth_scale = 0.001
+        self.depth_valid_ratio = 0.0
+        self.depth_min_m = 0.10
+        self.depth_max_m = 1.0
         self.last_update_time = 0.0
         self.objects2d = None
         self.objects3d = None
@@ -955,6 +1088,29 @@ class DashboardState:
         self.pixel_query_sequence = 0
         self.pixel_query_condition = threading.Condition(self.lock)
         self.robot_status = None
+
+
+def colorize_depth_bgr(depth, depth_scale=0.001, min_m=0.10, max_m=1.0):
+    """Render a RealSense-like depth colormap; invalid pixels stay black."""
+    depth_arr = np.asarray(depth)
+    if depth_arr.ndim != 2:
+        raise ValueError('depth must be HxW')
+    if np.issubdtype(depth_arr.dtype, np.floating):
+        depth_m = depth_arr.astype(np.float32)
+    else:
+        depth_m = depth_arr.astype(np.float32) * float(depth_scale)
+    valid = np.isfinite(depth_m) & (depth_m > 1e-6)
+    vis = np.zeros(depth_m.shape, dtype=np.uint8)
+    lo = float(min_m)
+    hi = max(lo + 1e-3, float(max_m))
+    if np.any(valid):
+        clipped = np.clip(depth_m, lo, hi)
+        norm = ((clipped - lo) / (hi - lo) * 255.0).astype(np.uint8)
+        vis[valid] = norm[valid]
+    colored = cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+    colored[~valid] = (0, 0, 0)
+    valid_ratio = float(np.count_nonzero(valid)) / float(depth_m.size) if depth_m.size else 0.0
+    return colored, valid_ratio
 
 
 class WebDashboardNode(Node):
@@ -985,6 +1141,9 @@ class WebDashboardNode(Node):
         self.bridge = CvBridge()
         self.state = DashboardState()
         self.state.jpeg_quality = max(1, min(100, self.jpeg_quality))
+        self.state.depth_scale = float(self.get_parameter('depth_scale').value)
+        self.state.depth_min_m = float(self.get_parameter('depth_preview_min_m').value)
+        self.state.depth_max_m = float(self.get_parameter('depth_preview_max_m').value)
         self.pixel_query_pub = self.create_publisher(PointStamped, self.pixel_query_topic, 10)
 
         self.debug_image_sub = None
@@ -1030,6 +1189,9 @@ class WebDashboardNode(Node):
         self.declare_parameter('pixel_query_topic', '/detector/pixel_query')
         self.declare_parameter('pixel_query_result_topic', '/detector/pixel_query_result_json')
         self.declare_parameter('robot_status_topic', '/robot/inspection_status')
+        self.declare_parameter('depth_scale', 0.001)
+        self.declare_parameter('depth_preview_min_m', 0.10)
+        self.declare_parameter('depth_preview_max_m', 1.0)
 
     def _image_callback(self, msg):
         try:
@@ -1057,6 +1219,39 @@ class WebDashboardNode(Node):
             self.state.image_height = int(image.shape[0])
             self.state.last_update_time = time.time()
             self.state.frame_condition.notify_all()
+
+    def ingest_depth(self, depth, depth_scale=None):
+        """Colorize and cache an in-memory depth frame for the side preview."""
+        try:
+            scale = float(self.state.depth_scale if depth_scale is None else depth_scale)
+            colored, valid_ratio = colorize_depth_bgr(
+                depth,
+                depth_scale=scale,
+                min_m=self.state.depth_min_m,
+                max_m=self.state.depth_max_m,
+            )
+            ok, encoded = cv2.imencode(
+                '.jpg',
+                colored,
+                [int(cv2.IMWRITE_JPEG_QUALITY), max(40, min(85, self.state.jpeg_quality))],
+            )
+        except Exception as exc:
+            self.get_logger().warn('Failed to encode depth preview: %s' % exc)
+            return
+        if not ok:
+            self.get_logger().warn('Failed to encode depth preview as JPEG.')
+            return
+
+        depth_arr = np.asarray(depth)
+        with self.state.depth_condition:
+            self.state.depth_jpeg = encoded.tobytes()
+            self.state.depth_raw = np.ascontiguousarray(depth_arr)
+            self.state.depth_width = int(depth_arr.shape[1])
+            self.state.depth_height = int(depth_arr.shape[0])
+            self.state.depth_scale = scale
+            self.state.depth_valid_ratio = float(valid_ratio)
+            self.state.last_update_time = time.time()
+            self.state.depth_condition.notify_all()
 
     def _objects_callback(self, msg):
         with self.state.lock:
@@ -1134,8 +1329,14 @@ class WebDashboardNode(Node):
                 if self.path.startswith('/api/state'):
                     self._send_json(self._snapshot())
                     return
+                if self.path.startswith('/api/depth_sample'):
+                    self._send_json(self._depth_sample())
+                    return
                 if self.path.startswith('/stream.mjpg'):
-                    self._stream_mjpeg()
+                    self._stream_mjpeg(kind='rgb')
+                    return
+                if self.path.startswith('/depth.mjpg'):
+                    self._stream_mjpeg(kind='depth')
                     return
                 self.send_error(404, 'not found')
 
@@ -1220,7 +1421,7 @@ class WebDashboardNode(Node):
                 result['accepted'] = True
                 self._send_json(result)
 
-            def _stream_mjpeg(self):
+            def _stream_mjpeg(self, kind='rgb'):
                 self.send_response(200)
                 self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
                 self.send_header('Cache-Control', 'no-store')
@@ -1228,10 +1429,11 @@ class WebDashboardNode(Node):
                 self.end_headers()
 
                 last_frame = None
+                condition = state.frame_condition if kind == 'rgb' else state.depth_condition
                 while True:
-                    with state.frame_condition:
-                        state.frame_condition.wait(timeout=frame_timeout_sec)
-                        frame = state.jpeg
+                    with condition:
+                        condition.wait(timeout=frame_timeout_sec)
+                        frame = state.jpeg if kind == 'rgb' else state.depth_jpeg
                     if frame is None or frame == last_frame:
                         continue
                     last_frame = frame
@@ -1244,6 +1446,51 @@ class WebDashboardNode(Node):
                     except (BrokenPipeError, ConnectionResetError):
                         return
 
+            def _depth_sample(self):
+                from urllib.parse import parse_qs, urlparse
+
+                query = parse_qs(urlparse(self.path).query)
+                try:
+                    nx = float((query.get('nx') or query.get('x') or ['0'])[0])
+                    ny = float((query.get('ny') or query.get('y') or ['0'])[0])
+                except (TypeError, ValueError):
+                    return {'ok': False, 'message': 'invalid nx/ny'}
+                nx = max(0.0, min(1.0, nx))
+                ny = max(0.0, min(1.0, ny))
+                with state.lock:
+                    depth = state.depth_raw
+                    width = int(state.depth_width)
+                    height = int(state.depth_height)
+                    scale = float(state.depth_scale)
+                    if depth is None or width <= 0 or height <= 0:
+                        return {'ok': False, 'message': 'no depth frame yet'}
+                    u = int(round(nx * float(width - 1)))
+                    v = int(round(ny * float(height - 1)))
+                    u = max(0, min(width - 1, u))
+                    v = max(0, min(height - 1, v))
+                    raw = depth[v, u]
+                    if np.issubdtype(np.asarray(raw).dtype, np.floating):
+                        depth_m = float(raw)
+                        raw_mm = int(round(depth_m / max(scale, 1e-9)))
+                    else:
+                        raw_mm = int(raw)
+                        depth_m = float(raw_mm) * scale
+                    valid = bool(np.isfinite(depth_m) and depth_m > 1e-6)
+                    return {
+                        'ok': True,
+                        'u': u,
+                        'v': v,
+                        'nx': nx,
+                        'ny': ny,
+                        'raw_mm': raw_mm,
+                        'depth_m': depth_m if valid else 0.0,
+                        'valid': valid,
+                        'depth_scale': scale,
+                        'width': width,
+                        'height': height,
+                        'valid_ratio': float(state.depth_valid_ratio),
+                    }
+
             def _snapshot(self):
                 with state.lock:
                     return {
@@ -1255,6 +1502,14 @@ class WebDashboardNode(Node):
                             'width': state.image_width,
                             'height': state.image_height,
                             'jpeg_quality': state.jpeg_quality,
+                        },
+                        'depth': {
+                            'width': state.depth_width,
+                            'height': state.depth_height,
+                            'depth_scale': state.depth_scale,
+                            'valid_ratio': state.depth_valid_ratio,
+                            'min_m': state.depth_min_m,
+                            'max_m': state.depth_max_m,
                         },
                         'objects': dashboard_objects_to_dict(state.objects3d, state.objects_ik_json),
                         'objects2d': object2d_array_to_dict(state.objects2d),
@@ -1333,6 +1588,9 @@ def object2d_to_dict(obj):
     payload['control_id'] = str(getattr(obj, 'control_id', ''))
     payload['spatial_relation'] = str(getattr(obj, 'spatial_relation', ''))
     payload['label_tag_present'] = bool(getattr(obj, 'label_tag_present', False))
+    geom = [float(v) for v in getattr(obj, 'geometric_center_px', [])]
+    if len(geom) >= 2:
+        payload['geometric_center_px'] = [geom[0], geom[1]]
     return payload
 
 
@@ -1457,6 +1715,12 @@ def dashboard_objects_to_dict(objects3d_msg, objects_ik_json):
             'handle_depth_mask_area_px',
             'handle_grasp_long_axis_length_px',
             'handle_depth_tip_distance_px',
+            'geometric_center_px',
+            'detection_source',
+            'seg_geometric_center_world_m',
+            'seg_geometric_center_target_m',
+            'seg_geometric_center_detail',
+            'seg_geometry_message',
         ):
             if key in ik_item:
                 item[key] = ik_item[key]

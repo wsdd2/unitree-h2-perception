@@ -67,6 +67,7 @@ class CabinetAutomationNode(Node):
         self.dispatched_status_key = None
         self.active_command_id = ''
         self.command_sequence = 0
+        self._last_observe_diag_monotonic = 0.0
 
         self.sock = None
         self.socket_buffer = b''
@@ -108,7 +109,7 @@ class CabinetAutomationNode(Node):
         self.declare_parameter('press_hold_sec', 0.35)
         self.declare_parameter('handle_preapproach_m', 0.10)
         self.declare_parameter('move_duration_sec', 2.0)
-        self.declare_parameter('expected_target_frame', 'pelvis')
+        self.declare_parameter('expected_target_frame', 'torso_link')
         self.declare_parameter('require_status_reachable', True)
         self.declare_parameter('status_max_age_sec', 3.0)
 
@@ -419,16 +420,22 @@ class CabinetAutomationNode(Node):
     def _update_observation_tracks(self, candidates):
         required = self._required_stable_frames()
         now = time.monotonic()
-        for _confidence, obj, xyz in candidates:
-            key = (
-                str(obj.detection.class_name).lower(),
-                int(round(obj.detection.cx / 8.0)),
-                int(round(obj.detection.cy / 8.0)),
-            )
+        # Observe: one track per class_name (highest-confidence instance each frame).
+        # Pixel-bin keys fragment when the bbox center jitters by a few pixels.
+        best_by_class = {}
+        for confidence, obj, xyz in candidates:
+            class_name = str(obj.detection.class_name).lower()
+            prev = best_by_class.get(class_name)
+            if prev is None or confidence > prev[0]:
+                best_by_class[class_name] = (confidence, obj, xyz)
+        for class_name, (_confidence, obj, xyz) in best_by_class.items():
+            key = class_name
             track = self.observation_tracks.get(key)
             if track is None:
-                track = {'points': deque(maxlen=required)}
+                track = {'points': deque(maxlen=max(required, 3))}
                 self.observation_tracks[key] = track
+            if track['points'].maxlen != max(required, 3):
+                track['points'] = deque(track['points'], maxlen=max(required, 3))
             track['points'].append(xyz)
             track['latest'] = {
                 'class_name': str(obj.detection.class_name),
@@ -443,6 +450,10 @@ class CabinetAutomationNode(Node):
                 'center_px': [float(obj.detection.cx), float(obj.detection.cy)],
             }
             track['received_monotonic'] = now
+
+    def _observe_track_max_age_sec(self):
+        # Camera runs ~6Hz; allow a few missed frames before declaring stale.
+        return max(float(self.target_max_age_sec), 1.5)
 
     def _stable_observations(self):
         command = self.command
@@ -461,6 +472,7 @@ class CabinetAutomationNode(Node):
             return None
         required = self._required_stable_frames()
         allowed_std = self._allowed_position_std_m()
+        max_age = self._observe_track_max_age_sec()
         results = []
         for requested_class in requested:
             matches = []
@@ -472,7 +484,7 @@ class CabinetAutomationNode(Node):
                 )
                 if requested_class not in identity.lower():
                     continue
-                if time.monotonic() - float(track.get('received_monotonic', 0.0)) > self.target_max_age_sec:
+                if time.monotonic() - float(track.get('received_monotonic', 0.0)) > max_age:
                     continue
                 if len(track['points']) < required:
                     continue
@@ -502,18 +514,106 @@ class CabinetAutomationNode(Node):
                 item['force_point_target_m'] = list(item['point_target_m'])
             if self._matches(latest['class_name'], HANDLE_CLASSES):
                 geometry = self._matching_handle_geometry(latest)
-                if geometry is None:
-                    return None
-                item.update(
-                    {
-                        'handle_image_left_target_m': geometry['image_left_target_m'],
-                        'handle_image_right_target_m': geometry['image_right_target_m'],
-                        'handle_center_target_m': geometry['center_target_m'],
-                        'handle_width_m': geometry['width_m'],
-                    }
-                )
+                if geometry is not None:
+                    item.update(
+                        {
+                            'handle_image_left_target_m': geometry['image_left_target_m'],
+                            'handle_image_right_target_m': geometry['image_right_target_m'],
+                            'handle_center_target_m': geometry['center_target_m'],
+                            'handle_width_m': geometry['width_m'],
+                        }
+                    )
+                else:
+                    # Observe-only: still report center; left/right edges may come later.
+                    item['handle_center_target_m'] = list(item['point_target_m'])
+                    item['handle_geometry_missing'] = True
             results.append(item)
         return results
+
+    def _observe_blocker_report(self):
+        """Explain why observe_targets has not emitted inspection_observation yet."""
+        command = self.command
+        if command is None:
+            return {'reason': 'no_command'}
+        if self.status is None:
+            return {'reason': 'no_inspection_status'}
+        now = time.monotonic()
+        if now - self.status_received_monotonic > self.status_max_age_sec:
+            return {'reason': 'robot_status_stale'}
+        if int(command.stage_id) >= 0 and int(command.stage_id) != int(self.status.stage_id):
+            return {
+                'reason': 'stage_id_mismatch',
+                'command_stage_id': int(command.stage_id),
+                'status_stage_id': int(self.status.stage_id),
+            }
+        requested = [
+            str(value).strip().lower()
+            for value in (
+                command.requested_semantic_names
+                if command.requested_semantic_names
+                else command.requested_class_names
+            )
+            if str(value).strip()
+        ]
+        required = self._required_stable_frames()
+        allowed_std = self._allowed_position_std_m()
+        max_age = self._observe_track_max_age_sec()
+        classes = []
+        for requested_class in requested:
+            best = {
+                'requested': requested_class,
+                'track_count': 0,
+                'best_frames': 0,
+                'best_age_sec': None,
+                'best_std_m': None,
+                'frame_ok': False,
+            }
+            for track in self.observation_tracks.values():
+                latest = track.get('latest') or {}
+                identity = '%s %s' % (
+                    str(latest.get('class_name', '')),
+                    str(latest.get('semantic_name', '')),
+                )
+                if requested_class not in identity.lower():
+                    continue
+                best['track_count'] += 1
+                frames = len(track['points'])
+                age = now - float(track.get('received_monotonic', 0.0))
+                std_xyz = None
+                if frames > 0:
+                    points = np.stack(tuple(track['points']), axis=0)
+                    std_xyz = float(np.max(np.std(points, axis=0)))
+                if frames >= best['best_frames']:
+                    best['best_frames'] = frames
+                    best['best_age_sec'] = round(age, 3)
+                    best['best_std_m'] = None if std_xyz is None else round(std_xyz, 4)
+                    best['frame_ok'] = (
+                        frames >= required
+                        and age <= max_age
+                        and (std_xyz is None or std_xyz <= allowed_std)
+                    )
+            if best['track_count'] == 0:
+                best['blocker'] = (
+                    'no_3d_track_for_class (web 2D!=automation 3D; check target_frame=%s conf/depth)'
+                    % self.expected_target_frame
+                )
+            elif best['best_frames'] < required:
+                best['blocker'] = 'need_%d_stable_frames_have_%d' % (required, best['best_frames'])
+            elif best['best_age_sec'] is not None and best['best_age_sec'] > max_age:
+                best['blocker'] = 'track_stale'
+            elif best['best_std_m'] is not None and best['best_std_m'] > allowed_std:
+                best['blocker'] = 'position_std_too_high'
+            else:
+                best['blocker'] = ''
+            classes.append(best)
+        return {
+            'reason': 'waiting_stable_observations',
+            'expected_target_frame': self.expected_target_frame,
+            'required_stable_frames': required,
+            'max_position_std_m': allowed_std,
+            'observe_track_max_age_sec': max_age,
+            'classes': classes,
+        }
 
     def _stable_target(self):
         required = self._required_stable_frames()
@@ -723,6 +823,18 @@ class CabinetAutomationNode(Node):
         if command is not None and str(command.requested_action).strip().lower().replace('-', '_') == 'observe_targets':
             observations = self._stable_observations()
             if observations is None:
+                if now - self._last_observe_diag_monotonic >= 2.0:
+                    self._last_observe_diag_monotonic = now
+                    report = self._observe_blocker_report()
+                    report.update(
+                        {
+                            'event': 'inspection_observation_pending',
+                            'command_id': str(command.command_id),
+                            'stage_id': int(command.stage_id),
+                        }
+                    )
+                    self._publish_result(report)
+                    self.get_logger().warn('observe_targets pending: %s' % json.dumps(report, ensure_ascii=False))
                 return
             self.dispatched_status_key = dispatch_key
             self._publish_result(

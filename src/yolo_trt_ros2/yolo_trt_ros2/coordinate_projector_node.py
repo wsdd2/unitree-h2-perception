@@ -86,6 +86,7 @@ from yolo_trt_ros2.work_tag_detector import (
     stage_prefers_hang_hook,
     stage_prefers_work_tag_grasp,
 )
+from yolo_trt_ros2.aruco_detector import is_aruco_class, solve_aruco_center_camera
 
 
 G1_H2_JOINT_INDEX = {
@@ -215,10 +216,18 @@ class CoordinateProjectorNode(Node):
             [0.0, 0.0, 0.0],
             3,
         )
+        # Fixed bias on all projected world points (torso/base), meters.
+        # Example: measured Y=0.0397 while truth is 0 → use [0, -0.0397, 0].
+        self.projected_world_offset_xyz = self._get_float_list_parameter(
+            'projected_world_offset_xyz',
+            [0.0, 0.0, 0.0],
+            3,
+        )
         self.fk_backend_requested = str(self.get_parameter('fk_backend').value).strip().lower()
         self.fk_backend_active = 'none'
         self.h2_xr_scripts_dir = str(self.get_parameter('h2_xr_scripts_dir').value)
         self.min_confidence = float(self.get_parameter('min_confidence').value)
+        self.aruco_marker_length_m = float(self.get_parameter('aruco_marker_length_m').value)
         self.depth_radius = int(self.get_parameter('depth_radius').value)
         self.depth_min_valid_count = int(self.get_parameter('depth_min_valid_count').value)
         self.depth_percentile = float(self.get_parameter('depth_percentile').value)
@@ -362,7 +371,7 @@ class CoordinateProjectorNode(Node):
         self.get_logger().info(
             'Target compensation active: dex1_tip_from_wrist=%s '
             'handeye_mount_offset=%s xr_ee_offset=%s effective_tip_from_mount=%s '
-            'apply_tip_compensation=%s lock_world_offset=%s depth_scale=%.6f'
+            'apply_tip_compensation=%s lock_world_offset=%s projected_world_offset=%s depth_scale=%.6f'
             % (
                 self._format_xyz(self.dex1_tip_from_wrist_xyz),
                 self._format_xyz(self.handeye_mount_offset_from_wrist_xyz),
@@ -370,6 +379,7 @@ class CoordinateProjectorNode(Node):
                 self._format_xyz(effective_tip),
                 self.apply_tip_compensation,
                 self._format_xyz(self.blue_point_target_world_offset_xyz),
+                self._format_xyz(self.projected_world_offset_xyz),
                 self.depth_scale,
             )
         )
@@ -402,16 +412,18 @@ class CoordinateProjectorNode(Node):
         self.declare_parameter('domain_id', 0)
         self.declare_parameter('lowstate_topic', 'rt/lowstate')
         self.declare_parameter('joint_json_path', '')
-        self.declare_parameter('lock_waist', True)
+        self.declare_parameter('lock_waist', False)
         self.declare_parameter('handeye_mount_offset_from_wrist_xyz', [0.0, 0.0, 0.0])
         self.declare_parameter('xr_ee_offset_from_wrist_xyz', [0.0, 0.0, 0.0])
-        self.declare_parameter('dex1_tip_from_wrist_xyz', [0.05, 0.0, 0.0])
-        self.declare_parameter('apply_tip_compensation', True)
+        self.declare_parameter('dex1_tip_from_wrist_xyz', [0.0, 0.0, 0.0])
+        self.declare_parameter('apply_tip_compensation', False)
         self.declare_parameter('blue_point_target_world_offset_xyz', [0.0, 0.0, 0.0])
+        self.declare_parameter('projected_world_offset_xyz', [0.0, 0.0, 0.0])
         self.declare_parameter('fk_backend', 'auto')
         self.declare_parameter('h2_xr_scripts_dir', '/home/unitree/H2_joint_cartesian/scripts')
         self.declare_parameter('class_filter', '')
         self.declare_parameter('min_confidence', 0.25)
+        self.declare_parameter('aruco_marker_length_m', 0.0)
         self.declare_parameter('depth_radius', 3)
         self.declare_parameter('depth_min_valid_count', 8)
         self.declare_parameter('depth_percentile', 35.0)
@@ -819,11 +831,13 @@ class CoordinateProjectorNode(Node):
                 self._publish_pixel_query_result(result)
                 return
             point_world, T_base_hand = transformed
+            point_world = self._apply_projected_world_offset(point_world)
             point_target, target_message = self._action_target_for_detection(None, point_world, T_base_hand)
             target_frame = self.handeye_target_frame or self.base_link or 'base_link'
             transform_message = 'eye_in_hand_fk; ' + target_message
         elif self.handeye_transform is not None:
             point_world = self._apply_transform(self.handeye_transform, point_camera)
+            point_world = self._apply_projected_world_offset(point_world)
             joints = self._current_joint_values()
             if not joints:
                 result['message'] = 'eye_to_hand target compensation unavailable: missing joints'
@@ -848,7 +862,7 @@ class CoordinateProjectorNode(Node):
                 result['message'] = 'TF transform unavailable'
                 self._publish_pixel_query_result(result)
                 return
-            point_world = transformed
+            point_world = self._apply_projected_world_offset(transformed)
             point_target = point_world
             target_frame = self.target_frame
             transform_message = 'transformed'
@@ -936,7 +950,8 @@ class CoordinateProjectorNode(Node):
             if not self._passes_filter(obj):
                 continue
 
-            self._apply_ground_ratio_to_red_sticker(obj)
+            if not str(getattr(obj, 'handle_grasp_source', '')).startswith('yoloseg'):
+                self._apply_ground_ratio_to_red_sticker(obj)
             object_3d = self._project_object(obj, objects_msg.header)
             if object_3d.valid or self.publish_invalid:
                 out_msg.objects.append(object_3d)
@@ -986,7 +1001,7 @@ class CoordinateProjectorNode(Node):
             for obj in objects
             if obj.valid
             and str(obj.detection.class_name).lower()
-            in ('red push button', 'green push button')
+            in ('red push button', 'green push button', 'yellow push button')
         ]
         if not button_z:
             return
@@ -1156,15 +1171,22 @@ class CoordinateProjectorNode(Node):
         return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
     def _project_object(self, obj, header):
-        depth_result = self._sample_object_depth_m(obj)
-        if depth_result is None:
-            return self._invalid_object(obj, header, 'no valid depth near center or bbox roi')
-        depth_m, depth_source, depth_valid_count = depth_result
-
-        try:
-            point_camera = self._deproject(float(obj.cx), float(obj.cy), depth_m)
-        except RuntimeError as exc:
-            return self._invalid_object(obj, header, str(exc))
+        depth_source = 'depth'
+        depth_valid_count = 0
+        pnp = self._try_aruco_pnp_camera(obj)
+        if pnp is not None:
+            point_camera, depth_m = pnp
+            depth_source = 'aruco_pnp'
+            depth_valid_count = 4
+        else:
+            depth_result = self._sample_object_depth_m(obj)
+            if depth_result is None:
+                return self._invalid_object(obj, header, 'no valid depth near center or bbox roi')
+            depth_m, depth_source, depth_valid_count = depth_result
+            try:
+                point_camera = self._deproject(float(obj.cx), float(obj.cy), depth_m)
+            except RuntimeError as exc:
+                return self._invalid_object(obj, header, str(exc))
         point_object = point_camera
         point_target = point_camera
         target_frame = header.frame_id
@@ -1180,11 +1202,13 @@ class CoordinateProjectorNode(Node):
                 )
             else:
                 point_object, T_base_hand = transformed
+                point_object = self._apply_projected_world_offset(point_object)
                 point_target, target_message = self._action_target_for_detection(obj, point_object, T_base_hand)
                 target_frame = self.handeye_target_frame or self.base_link or 'base_link'
                 message = 'eye_in_hand_fk; ' + target_message
         elif self.handeye_transform is not None:
             point_object = self._apply_transform(self.handeye_transform, point_camera)
+            point_object = self._apply_projected_world_offset(point_object)
             joints = self._current_joint_values()
             if not joints:
                 return self._invalid_object(
@@ -1211,7 +1235,7 @@ class CoordinateProjectorNode(Node):
             transformed = self._transform_point(point_camera, header.frame_id, self.target_frame)
             if transformed is None:
                 return self._invalid_object(obj, header, 'TF transform unavailable')
-            point_object = transformed
+            point_object = self._apply_projected_world_offset(transformed)
             point_target = point_object
             target_frame = self.target_frame
             message = 'transformed'
@@ -1491,6 +1515,42 @@ class CoordinateProjectorNode(Node):
         y = (v - cy) * depth_m / fy
         return np.array([x, y, depth_m], dtype=np.float64)
 
+    def _try_aruco_pnp_camera(self, obj):
+        """Optional metric PnP for aruco_tag_* when marker length is configured."""
+        if self.aruco_marker_length_m <= 1e-6:
+            return None
+        if not is_aruco_class(getattr(obj, 'class_name', '')):
+            return None
+        if self.latest_camera_info is None:
+            return None
+        edge = [float(v) for v in getattr(obj, 'handle_grasp_edge_px', [])]
+        if len(edge) < 8:
+            return None
+        corners = [
+            [edge[0], edge[1]],
+            [edge[2], edge[3]],
+            [edge[4], edge[5]],
+            [edge[6], edge[7]],
+        ]
+        k = self.latest_camera_info.k
+        camera_matrix = np.array(
+            [
+                [float(k[0]), float(k[1]), float(k[2])],
+                [float(k[3]), float(k[4]), float(k[5])],
+                [float(k[6]), float(k[7]), float(k[8])],
+            ],
+            dtype=np.float64,
+        )
+        dist = None
+        if getattr(self.latest_camera_info, 'd', None):
+            dist = np.asarray(self.latest_camera_info.d, dtype=np.float64).reshape(-1, 1)
+        return solve_aruco_center_camera(
+            corners,
+            camera_matrix,
+            dist,
+            self.aruco_marker_length_m,
+        )
+
     def _transform_point(self, point, source_frame, target_frame):
         if self.tf_buffer is None:
             return None
@@ -1545,6 +1605,14 @@ class CoordinateProjectorNode(Node):
         point_hand = self.T_cam2hand @ point_h
         point_target = T_base_hand @ point_hand
         return point_target[:3], T_base_hand
+
+    def _apply_projected_world_offset(self, point_xyz):
+        """Add fixed torso/base-frame bias to projected world points."""
+        point = np.asarray(point_xyz, dtype=np.float64).reshape(3)
+        offset = np.asarray(self.projected_world_offset_xyz, dtype=np.float64).reshape(3)
+        if np.linalg.norm(offset) <= 0.0:
+            return point
+        return point + offset
 
     def _action_target_for_detection(self, detection, point_object, T_base_hand=None):
         contact = np.asarray(point_object, dtype=np.float64).reshape(3)
@@ -1850,6 +1918,7 @@ class CoordinateProjectorNode(Node):
                 'ik': None,
             }
             item.update(self._handle_grasp_payload(object_3d.detection, joints))
+            item.update(self._seg_geometry_payload(object_3d.detection, joints))
             if not object_3d.valid:
                 item['ik'] = {'success': False, 'message': object_3d.message or 'invalid 3D object'}
                 payload['objects'].append(item)
@@ -1963,6 +2032,39 @@ class CoordinateProjectorNode(Node):
             payload['handle_grasp_ree_target_m'] = [float(x) for x in center_target]
             payload['handle_grasp_width_m'] = float(np.linalg.norm(ep1 - ep0))
             payload['handle_grasp_message'] = center_message
+        return payload
+
+    def _seg_geometry_payload(self, detection, joints):
+        """Project YOLO-seg geometric center when present on the Object2D."""
+        payload = {}
+        geom = [float(v) for v in getattr(detection, 'geometric_center_px', [])]
+        source = str(getattr(detection, 'handle_grasp_source', ''))
+        if len(geom) < 2:
+            return payload
+        payload['geometric_center_px'] = [geom[0], geom[1]]
+        if source.startswith('yoloseg'):
+            payload['detection_source'] = 'yoloseg'
+        if not joints:
+            return payload
+        try:
+            T_base_hand = self._compute_base_to_hand(joints)
+        except Exception as exc:
+            payload['seg_geometry_message'] = 'FK unavailable for seg geometric center: %s' % exc
+            return payload
+        projected = self._project_pixel_with_pose(geom[0], geom[1], T_base_hand)
+        if projected is None:
+            payload['seg_geometry_message'] = 'failed to project geometric_center_px'
+            return payload
+        world, depth_m, depth_count = projected
+        target, target_message = self._action_target_for_detection(detection, world, T_base_hand)
+        payload['seg_geometric_center_world_m'] = [float(x) for x in world]
+        payload['seg_geometric_center_target_m'] = [float(x) for x in target]
+        payload['seg_geometric_center_detail'] = {
+            'valid': True,
+            'depth_m': float(depth_m),
+            'depth_valid_count': int(depth_count),
+            'message': str(target_message),
+        }
         return payload
 
     def _estimate_depth_handle_grasp_edge_px(self, detection):
