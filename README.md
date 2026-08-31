@@ -1,6 +1,6 @@
 # H2 ROS Perception
 
-这是 H2 开门任务的 ROS2 感知工作区。当前日常使用链路是：
+这是 H2 ACT的 ROS2 感知工作区。当前日常使用链路是：
 
 ```text
 单进程 RealSense -> YOLOE/蓝点检测 -> 深度投影 -> 手眼/FK -> Dex1 补偿目标
