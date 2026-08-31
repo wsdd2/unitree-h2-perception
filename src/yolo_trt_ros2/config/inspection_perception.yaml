@@ -24,7 +24,9 @@ direct_realsense:
 yolo_detector:
   ros__parameters:
     image_topic: /camera/color/image_raw
-    objects_topic: /detector/objects
+    # Intermediate 2D detections. Final 3D results are published by yoloseg_backend
+    # on /detector/objects (Object3DArray).
+    objects_topic: /detector/objects_2d
     debug_image_topic: /detector/debug_image
     backend: yoloe
     model_path: /home/unitree/MscapeTech/models/yoloe-11s-seg.pt
@@ -93,7 +95,7 @@ yolo_detector:
     # Detector stack controls (CLI overrides YAML):
     #   detector_mode:=yoloe | yoloseg | hybrid | seg_on_request
     # or granular: enable_yoloe:=true/false + yolo_seg_run_mode:=off|always|on_request
-    detector_mode: 'hybrid'
+    detector_mode: 'yoloseg'
     enable_yoloe: true
     # Closed-set YOLO26-seg. always=preview every frame; on_request=run only when
     # InspectionCommand.requested_class_names overlaps SEG classes (saves GPU).
@@ -109,19 +111,24 @@ yolo_detector:
     # lock point: 80% from anti-ground edge == near-ground 20% of mask height.
     yolo_seg_lock_ground_ratio: 0.80
     # OpenCV HSV color prefix for push button / toggle (red|green|yellow).
-    yolo_seg_opencv_color: true
+    # Default off for SEG-only联调; enable when color-disambiguated class names are needed.
+    yolo_seg_opencv_color: false
     yolo_seg_inspection_command_topic: /robot/inspection_command
     yolo_seg_covered_classes: 'push button,rotary selector switch,rotary multiple selector switch,toggle switch,cabinet door handle,lock point,work tag,hang cord,hook'
     # Standalone detector honors this value. Integrated perception additionally
     # requires --webUI; without it no preview is drawn, encoded or published.
     publish_debug_image: true
 
-coordinate_projector:   
+yoloseg_backend:
   ros__parameters:
-    objects_topic: /detector/objects
+    # Intermediate Object2DArray from yolo_detector.
+    objects_topic: /detector/objects_2d
     depth_topic: /camera/aligned_depth_to_color/image_raw
     camera_info_topic: /camera/color/camera_info
-    objects_3d_topic: /detector/objects_3d
+    # Primary detection result for 运控 (Object3DArray).
+    objects_3d_topic: /detector/objects
+    # Legacy alias kept for older subscribers.
+    objects_3d_legacy_topic: /detector/objects_3d
     target_point_topic: /detector/target_point
     target_pose_topic: /detector/target_pose
     target_joint_state_topic: /detector/target_joint_state
@@ -197,12 +204,13 @@ coordinate_projector:
     control_row_z_tolerance_m: 0.04
     pixel_query_max_depth_m: 1.2
     publish_invalid: false
-    publish_target_pose: true
+    # Optional diagnostic / execution-helper topics (off by default).
+    publish_target_pose: false
+    publish_target_joint_state: false
+    publish_current_joint_state: false
+    publish_current_ee_point: false
+    publish_objects_ik_json: false
     target_pose_orientation_xyzw: [0.0, 0.0, 0.0, 1.0] # [0.0, 0.0, 0.0, 1.0] means no rotation
-    publish_current_joint_state: true
-    # Publish lock force point and handle two-side grasp geometry. Per-object
-    # IK stays disabled; the LowCmd worker performs the final execution IK.
-    publish_objects_ik_json: true
     publish_failed_ik_solution: false
     ik_target_link: right_wrist_yaw_link
     ik_active_joints: 'right_shoulder_pitch_joint,right_shoulder_roll_joint,right_shoulder_yaw_joint,right_elbow_joint,right_wrist_roll_joint,right_wrist_pitch_joint,right_wrist_yaw_joint'
@@ -236,7 +244,7 @@ cabinet_automation:
     execute_enabled: false
     worker_host: 127.0.0.1
     worker_port: 8765
-    objects_3d_topic: /detector/objects_3d
+    objects_3d_topic: /detector/objects
     objects_ik_topic: /detector/objects_ik_json
     inspection_command_topic: /robot/inspection_command
     robot_status_topic: /robot/inspection_status
@@ -261,8 +269,8 @@ web_dashboard:
     jpeg_quality: 80
     frame_timeout_sec: 2.0
     debug_image_topic: /detector/debug_image
-    objects_topic: /detector/objects
-    objects_3d_topic: /detector/objects_3d
+    objects_topic: /detector/objects_2d
+    objects_3d_topic: /detector/objects
     target_point_topic: /detector/target_point
     target_pose_topic: /detector/target_pose
     target_joint_state_topic: /detector/target_joint_state

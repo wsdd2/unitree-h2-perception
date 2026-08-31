@@ -20,7 +20,7 @@ string active_target_class_name
 string[] requested_semantic_names
 string active_target_semantic_name
 
-# highest_confidence / nearest / specified_target_id
+# highest_confidence / nearest / specified_target_id / rightmost / leftmost
 string selection_policy
 string target_id
 

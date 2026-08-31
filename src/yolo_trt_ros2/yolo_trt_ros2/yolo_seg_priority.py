@@ -30,7 +30,7 @@ DEFAULT_SEG_CLASS_NAMES = (
 PUBLISH_NAME = {
     'push button': 'push button',
     'rotary selector switch': 'black rotary selector switch',
-    'rotary multiple selector switch': 'black rotary selector switch',
+    'rotary multiple selector switch': 'black rotary multiple selector switch',
     'toggle switch': 'toggle switch',
     'cabinet door handle': 'black cabinet door handle',
     'lock point': 'lock point',
@@ -40,10 +40,20 @@ PUBLISH_NAME = {
 }
 
 # requested_class_names tokens that activate each seg family.
+# Keep rotary vs rotary-multiple aliases disjoint (no shared "selector switch").
 REQUEST_ALIASES = {
     'push button': ('push button', 'button'),
-    'rotary selector switch': ('rotary selector', 'rotary multiple', 'selector switch'),
-    'rotary multiple selector switch': ('rotary multiple', 'multi selector'),
+    'rotary selector switch': (
+        'black rotary selector switch',
+        'rotary selector switch',
+        'rotary selector',
+    ),
+    'rotary multiple selector switch': (
+        'black rotary multiple selector switch',
+        'rotary multiple selector switch',
+        'rotary multiple',
+        'multi selector',
+    ),
     'toggle switch': ('toggle switch', 'rocker switch', 'toggle'),
     'cabinet door handle': ('cabinet door handle', 'door handle', 'handle'),
     'lock point': ('lock point', 'push point', 'sticker push'),
@@ -172,6 +182,44 @@ def requested_activates_seg(requested: Sequence[str], seg_class: str) -> bool:
     return False
 
 
+def detection_matches_active_request(
+    requested: Sequence[str],
+    seg_class: str,
+    publish_name: str,
+    opencv_color: Optional[str] = None,
+) -> bool:
+    """Match publish-side request names against model seg families + color.
+
+    Requests look like ``green push button``; YOLO classes are ``push button``.
+    Exact-string filters against seg_name drop every detection.
+    """
+    req = [str(item).strip() for item in requested if str(item).strip()]
+    if not req:
+        return True
+    seg_n = normalize_name(seg_class)
+    family_matches = [
+        item for item in req if requested_activates_seg([item], seg_n)
+    ]
+    if not family_matches:
+        return False
+    color_constrained = []
+    for item in family_matches:
+        item_n = normalize_name(item)
+        colors = [c for c in SUPPORTED_COLORS if c in item_n]
+        if colors:
+            color_constrained.append(colors)
+    if not color_constrained:
+        return True
+    pub_n = normalize_name(publish_name)
+    for colors in color_constrained:
+        for color in colors:
+            if color in pub_n:
+                return True
+            if opencv_color is not None and color == opencv_color:
+                return True
+    return False
+
+
 def any_requested_covered(requested: Sequence[str], covered_classes: Sequence[str]) -> bool:
     for seg_class in covered_classes:
         if requested_activates_seg(requested, seg_class):
@@ -193,6 +241,8 @@ def detection_family_key(class_name: str) -> Optional[str]:
         return 'work tag'
     if 'push button' in name or name == 'button':
         return 'push button'
+    if 'rotary multiple' in name or 'multiple selector' in name:
+        return 'rotary multiple selector switch'
     if 'rotary' in name or 'selector' in name:
         return 'rotary selector switch'
     if 'toggle' in name or 'rocker' in name:
@@ -269,9 +319,6 @@ class YoloSegPriorityBackend(object):
         masks = getattr(result, 'masks', None)
         img_h, img_w = bgr_image.shape[:2]
         down = self._normalize_down(down_uv)
-        allowed = None
-        if active_seg_classes is not None:
-            allowed = {normalize_name(name) for name in active_seg_classes}
 
         detections = []
         for i in range(len(boxes)):
@@ -279,7 +326,9 @@ class YoloSegPriorityBackend(object):
             cls_id = int(boxes.cls[i].item())
             raw_name = str(names.get(cls_id, self._class_name(cls_id)))
             seg_name = normalize_name(raw_name)
-            if allowed is not None and seg_name not in allowed:
+            if active_seg_classes is not None and not requested_activates_seg(
+                active_seg_classes, seg_name
+            ):
                 continue
 
             xyxy = boxes.xyxy[i].cpu().numpy().astype(float)
@@ -301,6 +350,10 @@ class YoloSegPriorityBackend(object):
             if self.enable_opencv_color and seg_name in COLORIZED_SEG_CLASSES:
                 opencv_color = classify_mask_color(bgr_image, smoothed)
             publish_name = colored_publish_name(seg_name, opencv_color)
+            if active_seg_classes is not None and not detection_matches_active_request(
+                active_seg_classes, seg_name, publish_name, opencv_color
+            ):
+                continue
             det = {
                 'class_name': publish_name,
                 'class_id': cls_id,

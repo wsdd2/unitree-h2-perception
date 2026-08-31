@@ -309,6 +309,61 @@ def _web_port_from_argv(argv):
     return None
 
 
+def _endpoint_topics(node):
+    """Return (publish_topics, subscribe_topics) for a live rclpy node."""
+    pubs = []
+    subs = []
+    for pub in list(getattr(node, '_publishers', []) or []):
+        topic = str(getattr(pub, 'topic_name', '') or '').strip()
+        if topic:
+            pubs.append(topic)
+    for sub in list(getattr(node, '_subscriptions', []) or []):
+        topic = str(getattr(sub, 'topic_name', '') or '').strip()
+        if topic:
+            subs.append(topic)
+    return sorted(set(pubs)), sorted(set(subs))
+
+
+def _log_integrated_topics(nodes):
+    """Print publish/subscribe topics right after the integrated stack is up."""
+    lines = [
+        '======== Integrated perception ROS topics ========',
+        'ROS_DOMAIN_ID=%s  ROS_LOCALHOST_ONLY=%s'
+        % (
+            os.environ.get('ROS_DOMAIN_ID', '0'),
+            os.environ.get('ROS_LOCALHOST_ONLY', '<unset>'),
+        ),
+    ]
+    all_pub = set()
+    all_sub = set()
+    for node in nodes:
+        name = node.get_fully_qualified_name()
+        pubs, subs = _endpoint_topics(node)
+        all_pub.update(pubs)
+        all_sub.update(subs)
+        lines.append('node: %s' % name)
+        lines.append('  publish (%d):' % len(pubs))
+        if pubs:
+            for topic in pubs:
+                lines.append('    %s' % topic)
+        else:
+            lines.append('    (none)')
+        lines.append('  subscribe (%d):' % len(subs))
+        if subs:
+            for topic in subs:
+                lines.append('    %s' % topic)
+        else:
+            lines.append('    (none)')
+    lines.append('---- summary ----')
+    lines.append('all publish (%d): %s' % (len(all_pub), ', '.join(sorted(all_pub)) or '(none)'))
+    lines.append('all subscribe (%d): %s' % (len(all_sub), ', '.join(sorted(all_sub)) or '(none)'))
+    lines.append('======== end integrated topics ========')
+    text = '\n'.join(lines)
+    print(text, flush=True)
+    if nodes:
+        nodes[0].get_logger().info(text)
+
+
 def main(args=None):
     argv = list(sys.argv if args is None else args)
     options, ros_argv = _parse_app_args(argv)
@@ -340,6 +395,7 @@ def main(args=None):
 
         for node in nodes:
             executor.add_node(node)
+        _log_integrated_topics(nodes)
         executor.spin()
     except KeyboardInterrupt:
         pass

@@ -22,6 +22,7 @@ PERCEPTION_CMDLINE_MARKERS: Tuple[str, ...] = (
     'yolo_trt_ros2.direct_realsense',
     'yolo_trt_ros2.coordinate_projector',
     'coordinate_projector_node',
+    'yoloseg_backend',
     'yolo_trt_ros2.web_dashboard',
     'web_dashboard_node',
     'inspection_perception.launch',
@@ -40,6 +41,7 @@ CAMERA_OWNER_MARKERS: Tuple[str, ...] = (
 
 class PerceptionAlreadyRunningError(RuntimeError):
     """Raised when another same-function perception stack is already active."""
+
 
 
 def _decode(data: bytes) -> str:
@@ -241,3 +243,11 @@ def assert_no_conflicting_perception(
     if not conflicts:
         return
     raise PerceptionAlreadyRunningError(format_conflict_report(conflicts, domain_id=domain_id))
+
+def clean_up_conflicting_perception():
+    conflicts = find_conflicting_perception()
+    if not conflicts:
+        return
+    for conflict in conflicts:
+        os.kill(conflict['pid'], signal.SIGTERM)
+    return

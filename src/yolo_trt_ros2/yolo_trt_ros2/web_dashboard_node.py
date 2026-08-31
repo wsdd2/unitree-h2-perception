@@ -1178,8 +1178,8 @@ class WebDashboardNode(Node):
         self.declare_parameter('jpeg_quality', 80)
         self.declare_parameter('frame_timeout_sec', 2.0)
         self.declare_parameter('debug_image_topic', '/detector/debug_image')
-        self.declare_parameter('objects_topic', '/detector/objects')
-        self.declare_parameter('objects_3d_topic', '/detector/objects_3d')
+        self.declare_parameter('objects_topic', '/detector/objects_2d')
+        self.declare_parameter('objects_3d_topic', '/detector/objects')
         self.declare_parameter('target_point_topic', '/detector/target_point')
         self.declare_parameter('target_pose_topic', '/detector/target_pose')
         self.declare_parameter('target_joint_state_topic', '/detector/target_joint_state')
@@ -1635,9 +1635,9 @@ def dashboard_diagnostics(state, now):
             'Check /camera/color/image_raw, yolo_detector_node, and detector backend logs.'
         )
     if state.objects2d is None:
-        warnings.append('WARN: no /detector/objects received yet.')
+        warnings.append('WARN: no /detector/objects_2d received yet.')
     if state.objects3d is None:
-        warnings.append('WARN: no /detector/objects_3d received yet. Check depth image and CameraInfo.')
+        warnings.append('WARN: no /detector/objects received yet. Check depth image and CameraInfo.')
     if state.current_joint_state is None:
         warnings.append('WARN: no /detector/current_joint_state received yet. Check Unitree lowstate topic/interface.')
     if state.last_update_time <= 0.0:

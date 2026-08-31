@@ -96,7 +96,7 @@ class CabinetAutomationNode(Node):
         self.declare_parameter('execute_enabled', False)
         self.declare_parameter('worker_host', '127.0.0.1')
         self.declare_parameter('worker_port', 8765)
-        self.declare_parameter('objects_3d_topic', '/detector/objects_3d')
+        self.declare_parameter('objects_3d_topic', '/detector/objects')
         self.declare_parameter('objects_ik_topic', '/detector/objects_ik_json')
         self.declare_parameter('inspection_command_topic', '/robot/inspection_command')
         self.declare_parameter('robot_status_topic', '/robot/inspection_status')

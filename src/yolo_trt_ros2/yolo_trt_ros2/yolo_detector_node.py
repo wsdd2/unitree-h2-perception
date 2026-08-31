@@ -340,7 +340,7 @@ class YoloDetectorNode(Node):
         return bgr_image
     def _declare_parameters(self):
         self.declare_parameter('image_topic', '/camera/color/image_raw')
-        self.declare_parameter('objects_topic', '/detector/objects')
+        self.declare_parameter('objects_topic', '/detector/objects_2d')
         self.declare_parameter('debug_image_topic', '/detector/debug_image')
         self.declare_parameter('engine_path', '')
         self.declare_parameter('model_path', '')
@@ -410,7 +410,7 @@ class YoloDetectorNode(Node):
         self.declare_parameter('yolo_seg_mask_smooth_ksize', 5)
         self.declare_parameter('yolo_seg_mask_close_iters', 1)
         self.declare_parameter('yolo_seg_lock_ground_ratio', 0.80)
-        self.declare_parameter('yolo_seg_opencv_color', True)
+        self.declare_parameter('yolo_seg_opencv_color', False)
         self.declare_parameter('yolo_seg_inspection_command_topic', '/robot/inspection_command')
         self.declare_parameter(
             'yolo_seg_covered_classes',

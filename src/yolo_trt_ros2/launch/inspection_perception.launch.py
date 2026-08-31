@@ -103,7 +103,7 @@ def generate_launch_description():
     )
     detector_mode_arg = DeclareLaunchArgument(
         'detector_mode',
-        default_value='hybrid',
+        default_value='yoloseg',
         description=(
             'Detection stack preset: yoloe | yoloseg | hybrid | seg_on_request. '
             'hybrid = YOLOE + YOLOSeg always; seg_on_request = YOLOE + SEG only when requested.'
@@ -124,7 +124,7 @@ def generate_launch_description():
     )
     yolo_seg_opencv_color_arg = DeclareLaunchArgument(
         'yolo_seg_opencv_color',
-        default_value='true',
+        default_value='false',
         description=(
             'Enable OpenCV HSV color semantics for YOLOSeg push button / toggle '
             '(red|green|yellow prefixes).'

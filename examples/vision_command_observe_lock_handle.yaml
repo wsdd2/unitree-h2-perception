@@ -1,0 +1,26 @@
+# 本文件由 /h2_arm/vision_command Trigger 服务读取。
+# command_id作为前缀；节点会自动追加时间戳，确保每次服务调用唯一。
+command_id: "observe_lock_handle"
+
+stage_id: 1
+stage_name: "locate_lock_and_handle"
+requested_action: "observe_targets"
+
+requested_class_names:
+  - "lock point"
+  - "black cabinet door handle"
+
+# observe_targets只观察，不指定物理执行目标。
+active_target_class_name: ""
+
+requested_semantic_names: []
+active_target_semantic_name: ""
+
+selection_policy: "highest_confidence"
+target_id: ""
+lock_target: false
+
+min_confidence: 0.30
+required_stable_frames: 3
+max_position_std_m: 0.005
+timeout_sec: 20.0

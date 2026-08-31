@@ -168,13 +168,16 @@ class CoordinateProjectorNode(Node):
         node_kwargs = {}
         if parameter_overrides is not None:
             node_kwargs['parameter_overrides'] = parameter_overrides
-        super().__init__('coordinate_projector', **node_kwargs)
+        super().__init__('yoloseg_backend', **node_kwargs)
         self._declare_parameters()
 
         self.objects_topic = self.get_parameter('objects_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
         self.objects_3d_topic = self.get_parameter('objects_3d_topic').value
+        self.objects_3d_legacy_topic = str(
+            self.get_parameter('objects_3d_legacy_topic').value
+        ).strip()
         self.target_point_topic = self.get_parameter('target_point_topic').value
         self.target_pose_topic = self.get_parameter('target_pose_topic').value
         self.target_joint_state_topic = self.get_parameter('target_joint_state_topic').value
@@ -260,6 +263,7 @@ class CoordinateProjectorNode(Node):
         self.publish_target_pose = bool(self.get_parameter('publish_target_pose').value)
         self.publish_target_joint_state = bool(self.get_parameter('publish_target_joint_state').value)
         self.publish_current_joint_state = bool(self.get_parameter('publish_current_joint_state').value)
+        self.publish_current_ee_point = bool(self.get_parameter('publish_current_ee_point').value)
         self.publish_objects_ik_json = bool(self.get_parameter('publish_objects_ik_json').value)
         self.publish_failed_ik_solution = bool(self.get_parameter('publish_failed_ik_solution').value)
         self.stale_depth_sec = float(self.get_parameter('stale_depth_sec').value)
@@ -328,12 +332,39 @@ class CoordinateProjectorNode(Node):
                 self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.objects_3d_pub = self.create_publisher(Object3DArray, self.objects_3d_topic, 10)
+        self.objects_3d_legacy_pub = None
+        if self.objects_3d_legacy_topic and self.objects_3d_legacy_topic != self.objects_3d_topic:
+            self.objects_3d_legacy_pub = self.create_publisher(
+                Object3DArray,
+                self.objects_3d_legacy_topic,
+                10,
+            )
         self.target_point_pub = self.create_publisher(PointStamped, self.target_point_topic, 10)
-        self.target_pose_pub = self.create_publisher(PoseStamped, self.target_pose_topic, 10)
-        self.target_joint_state_pub = self.create_publisher(JointState, self.target_joint_state_topic, 10)
-        self.current_joint_state_pub = self.create_publisher(JointState, self.current_joint_state_topic, 10)
-        self.current_ee_point_pub = self.create_publisher(PointStamped, self.current_ee_point_topic, 10)
-        self.objects_ik_pub = self.create_publisher(String, self.objects_ik_topic, 10)
+        self.target_pose_pub = (
+            self.create_publisher(PoseStamped, self.target_pose_topic, 10)
+            if self.publish_target_pose
+            else None
+        )
+        self.target_joint_state_pub = (
+            self.create_publisher(JointState, self.target_joint_state_topic, 10)
+            if self.publish_target_joint_state
+            else None
+        )
+        self.current_joint_state_pub = (
+            self.create_publisher(JointState, self.current_joint_state_topic, 10)
+            if self.publish_current_joint_state
+            else None
+        )
+        self.current_ee_point_pub = (
+            self.create_publisher(PointStamped, self.current_ee_point_topic, 10)
+            if self.publish_current_ee_point
+            else None
+        )
+        self.objects_ik_pub = (
+            self.create_publisher(String, self.objects_ik_topic, 10)
+            if self.publish_objects_ik_json
+            else None
+        )
         self.pixel_query_result_pub = self.create_publisher(String, self.pixel_query_result_topic, 10)
 
         self.depth_sub = None
@@ -353,10 +384,13 @@ class CoordinateProjectorNode(Node):
         self.create_timer(0.1, self._current_joint_timer_callback)
 
         self.get_logger().info(
-            'Coordinate projector started: input=%s, objects=%s, depth=%s, camera_info=%s, target_frame=%s, handeye_mode=%s, handeye=%s'
+            'YOLOSeg backend started: input=%s, objects_2d=%s, objects=%s, objects_3d_legacy=%s, '
+            'depth=%s, camera_info=%s, target_frame=%s, handeye_mode=%s, handeye=%s'
             % (
                 'ROS topics' if subscribe_perception_inputs else 'in-process RGB-D',
                 self.objects_topic,
+                self.objects_3d_topic,
+                self.objects_3d_legacy_topic or '<off>',
                 self.depth_topic,
                 self.camera_info_topic,
                 self._output_frame_name(),
@@ -385,10 +419,11 @@ class CoordinateProjectorNode(Node):
         )
 
     def _declare_parameters(self):
-        self.declare_parameter('objects_topic', '/detector/objects')
+        self.declare_parameter('objects_topic', '/detector/objects_2d')
         self.declare_parameter('depth_topic', '/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/color/camera_info')
-        self.declare_parameter('objects_3d_topic', '/detector/objects_3d')
+        self.declare_parameter('objects_3d_topic', '/detector/objects')
+        self.declare_parameter('objects_3d_legacy_topic', '/detector/objects_3d')
         self.declare_parameter('target_point_topic', '/detector/target_point')
         self.declare_parameter('target_pose_topic', '/detector/target_pose')
         self.declare_parameter('target_joint_state_topic', '/detector/target_joint_state')
@@ -448,10 +483,11 @@ class CoordinateProjectorNode(Node):
         self.declare_parameter('control_row_z_tolerance_m', 0.04)
         self.declare_parameter('pixel_query_max_depth_m', 1.2)
         self.declare_parameter('publish_invalid', False)
-        self.declare_parameter('publish_target_pose', True)
+        self.declare_parameter('publish_target_pose', False)
         self.declare_parameter('publish_target_joint_state', False)
-        self.declare_parameter('publish_current_joint_state', True)
-        self.declare_parameter('publish_objects_ik_json', True)
+        self.declare_parameter('publish_current_joint_state', False)
+        self.declare_parameter('publish_current_ee_point', False)
+        self.declare_parameter('publish_objects_ik_json', False)
         self.declare_parameter('publish_failed_ik_solution', False)
         self.declare_parameter('target_pose_orientation_xyzw', [0.0, 0.0, 0.0, 1.0])
         self.declare_parameter('ik_target_link', '')
@@ -762,6 +798,12 @@ class CoordinateProjectorNode(Node):
         """Project an in-memory Object2DArray using the synchronized depth cache."""
         self._objects_callback(objects_msg)
 
+    def _publish_objects_3d(self, out_msg):
+        """Publish detection results on /detector/objects (+ optional legacy alias)."""
+        self.objects_3d_pub.publish(out_msg)
+        if self.objects_3d_legacy_pub is not None:
+            self.objects_3d_legacy_pub.publish(out_msg)
+
     def _robot_status_callback(self, msg):
         self.latest_robot_status = msg
 
@@ -916,7 +958,7 @@ class CoordinateProjectorNode(Node):
         if self.latest_depth is None or self.latest_camera_info is None:
             out_msg.objects = [self._invalid_object(obj, objects_msg.header, 'missing depth or CameraInfo')
                                for obj in objects_msg.objects if self.publish_invalid]
-            self.objects_3d_pub.publish(out_msg)
+            self._publish_objects_3d(out_msg)
             return
 
         depth_match = self._select_depth_for_header(objects_msg.header)
@@ -934,7 +976,7 @@ class CoordinateProjectorNode(Node):
                 for obj in objects_msg.objects
                 if self.publish_invalid
             ]
-            self.objects_3d_pub.publish(out_msg)
+            self._publish_objects_3d(out_msg)
             return
 
         self.latest_depth_stamp_ns, self.latest_depth = depth_match
@@ -975,7 +1017,7 @@ class CoordinateProjectorNode(Node):
 
         self._apply_3d_control_row_semantics(out_msg.objects)
         self._log_3d_diagnostics_if_changed(out_msg.objects)
-        self.objects_3d_pub.publish(out_msg)
+        self._publish_objects_3d(out_msg)
         joints = self._current_joint_values()
         if joints:
             self._publish_current_joint_state(joints, objects_msg.header)
@@ -1827,7 +1869,7 @@ class CoordinateProjectorNode(Node):
         return vec + 2.0 * (w * uv + uuv)
 
     def _publish_current_joint_state(self, joints, header):
-        if not self.publish_current_joint_state:
+        if not self.publish_current_joint_state or self.current_joint_state_pub is None:
             return
         msg = JointState()
         msg.header.stamp = header.stamp
@@ -1838,20 +1880,25 @@ class CoordinateProjectorNode(Node):
         self.current_joint_state_pub.publish(msg)
 
     def _current_joint_timer_callback(self):
-        if not self.publish_current_joint_state:
+        need_joints = self.publish_current_joint_state and self.current_joint_state_pub is not None
+        need_ee = self.publish_current_ee_point and self.current_ee_point_pub is not None
+        if not need_joints and not need_ee:
             return
         joints = self._current_joint_values()
         if not joints:
             return
         stamp = self.get_clock().now().to_msg()
-        msg = JointState()
-        msg.header.stamp = stamp
-        msg.header.frame_id = self.base_link or self._default_base_link()
-        names = sorted(joints.keys())
-        msg.name = names
-        msg.position = [float(joints[name]) for name in names]
-        self.current_joint_state_pub.publish(msg)
+        if need_joints:
+            msg = JointState()
+            msg.header.stamp = stamp
+            msg.header.frame_id = self.base_link or self._default_base_link()
+            names = sorted(joints.keys())
+            msg.name = names
+            msg.position = [float(joints[name]) for name in names]
+            self.current_joint_state_pub.publish(msg)
 
+        if not need_ee:
+            return
         try:
             transform = np.asarray(self._compute_base_to_hand(joints), dtype=np.float64)
         except Exception as exc:
@@ -1864,7 +1911,7 @@ class CoordinateProjectorNode(Node):
         self.current_ee_point_pub.publish(point_msg)
 
     def _publish_objects_ik_json(self, objects_3d_msg, header, joints):
-        if not self.publish_objects_ik_json:
+        if not self.publish_objects_ik_json or self.objects_ik_pub is None:
             return
 
         payload = {
@@ -2341,7 +2388,7 @@ class CoordinateProjectorNode(Node):
         point_msg.point = object_3d.point_target
         self.target_point_pub.publish(point_msg)
 
-        if self.publish_target_pose:
+        if self.publish_target_pose and self.target_pose_pub is not None:
             pose_msg = PoseStamped()
             pose_msg.header = header
             pose_msg.pose.position = object_3d.point_target
@@ -2355,7 +2402,7 @@ class CoordinateProjectorNode(Node):
         self._publish_target_joint_state(object_3d, header)
 
     def _publish_target_joint_state(self, object_3d, header):
-        if not self.publish_target_joint_state:
+        if not self.publish_target_joint_state or self.target_joint_state_pub is None:
             return
         if self._ik_solver is None:
             self._warn_ik('IK solver is unavailable: %s' % (self._ik_error or 'not initialized'))

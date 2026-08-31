@@ -2,11 +2,8 @@
 # H2 inspection perception launcher (LF endings).
 # Usage:
 #   bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
-#   DETECTOR_MODE=yoloe bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
-#   DETECTOR_MODE=yoloseg bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
 #   DETECTOR_MODE=hybrid bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
-#   DETECTOR_MODE=seg_on_request bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
-#   YOLO_SEG_OPENCV_COLOR=false bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
+#   YOLO_SEG_OPENCV_COLOR=true bash ~/MscapeTech/Foxy_ROS/scripts/start_perception_h2.sh
 set -eo pipefail
 
 cd ~/MscapeTech/Foxy_ROS
@@ -46,11 +43,30 @@ print(
 )
 PY
 
-# Default: both YOLOE + YOLOSeg every frame (hybrid).
+# Default: closed-set YOLOSeg only (no YOLOE). Color prefixes off.
 # Optional override: yoloe | yoloseg | hybrid | seg_on_request
-DETECTOR_MODE="${DETECTOR_MODE:-hybrid}"
+DETECTOR_MODE="${DETECTOR_MODE:-yoloseg}"
 # OpenCV HSV color prefixes for YOLOSeg push button / toggle. true|false
-YOLO_SEG_OPENCV_COLOR="${YOLO_SEG_OPENCV_COLOR:-true}"
+YOLO_SEG_OPENCV_COLOR="${YOLO_SEG_OPENCV_COLOR:-false}"
+
+# After nodes come up, dump Domain-wide pubs/subs (includes automation node).
+TOPIC_DUMP_DELAY_SEC="${TOPIC_DUMP_DELAY_SEC:-12}"
+(
+  sleep "${TOPIC_DUMP_DELAY_SEC}"
+  echo "======== ROS2 domain topic dump (after ${TOPIC_DUMP_DELAY_SEC}s) ========"
+  echo "ROS_DOMAIN_ID=${ROS_DOMAIN_ID} ROS_LOCALHOST_ONLY=${ROS_LOCALHOST_ONLY}"
+  echo "---- ros2 topic list -t ----"
+  ros2 topic list -t 2>/dev/null || echo "(ros2 topic list failed)"
+  echo "---- ros2 node list ----"
+  ros2 node list 2>/dev/null || echo "(ros2 node list failed)"
+  echo "---- ros2 node info ----"
+  while IFS= read -r node_name; do
+    [ -n "${node_name}" ] || continue
+    echo "## ${node_name}"
+    ros2 node info "${node_name}" 2>/dev/null || true
+  done < <(ros2 node list 2>/dev/null || true)
+  echo "======== end ROS2 domain topic dump ========"
+) &
 
 ros2 launch yolo_trt_ros2 inspection_perception.launch.py \
   config_file:=/home/unitree/MscapeTech/Foxy_ROS/src/yolo_trt_ros2/config/inspection_perception.yaml \
