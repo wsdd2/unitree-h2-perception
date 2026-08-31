@@ -1,6 +1,6 @@
 # Unitree H2 Perception
 
-面向 [Unitree H2](https://www.unitree.com/) 的 ROS2 Humble 感知工作区。仓库覆盖电柜巡检整条视觉链路，而不再只服务开门任务：按钮、旋钮、拨动开关、门锁着力点、柜门把手、工作牌/挂钩、表计，以及 OCR 铭牌语义。
+面向 [Unitree H2](https://www.unitree.com/) 的 ROS2 Humble 感知工作区。示例任务为电网电柜检修任务，包括：按钮、旋钮、拨动开关、门锁着力点、柜门把手、工作牌/挂钩、表计，以及 OCR 铭牌语义。
 
 当前日常链路：
 
